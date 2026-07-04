@@ -43,22 +43,26 @@ import torch
 
 
 def _row_budget(count: int, *, topk_val: int, topk_ratio: float,
-                reserved_bos: int) -> tuple[int, int]:
-    """Return ``(bos, middle_k)`` for a row with ``count = d+1`` candidate blocks.
+                reserved_bos: int, reserved_eos: int = 1) -> tuple[int, int, int]:
+    """Return ``(bos, eos, middle_k)`` for a row with ``count = d+1`` candidate blocks.
 
-    Mirrors the decode budget (``max(static, dynamic)`` clamped to the available
-    block count) with the diagonal counted as the single ``eos`` slot.
+    Mirrors the DECODE budget exactly: reserve ``bos`` prefix blocks ``[0,bos)`` and
+    the causal ``eos`` suffix ``[d-eos+1, d]`` (the query's own diagonal block plus
+    the ``eos-1`` local blocks just before it), and top-k over the strictly-past
+    middle ``[bos, d-eos]``. Matching ``reserved_eos`` is REQUIRED: the decode
+    planner only scores ``[0, d-eos]`` (workload ``= dense - eos``), so ranking any
+    block in ``[d-eos+1, d]`` would read stale/uncomputed scores.
     """
     d = count - 1
+    eos = min(max(1, reserved_eos), count)         # ≥1 (diagonal); ≤ available
     bos = reserved_bos if (reserved_bos > 0 and d >= 1) else 0
-    bos = min(bos, max(0, d))                      # can't reserve past what exists
-    static_budget = topk_val + bos + 1             # +1 = diagonal (eos)
+    bos = min(bos, max(0, count - eos))            # don't overlap the eos suffix
+    static_budget = topk_val + bos + eos
     dynamic_budget = int(math.floor(count * topk_ratio))
-    sparse_count = max(static_budget, dynamic_budget)
-    sparse_count = min(sparse_count, count)
-    middle_k = sparse_count - bos - 1
-    middle_k = max(0, min(middle_k, d - bos))      # available middle = [bos, d-1]
-    return bos, middle_k
+    sparse_count = min(max(static_budget, dynamic_budget), count)
+    middle_avail = max(0, count - bos - eos)       # blocks in [bos, d-eos]
+    middle_k = max(0, min(sparse_count - bos - eos, middle_avail))
+    return bos, eos, middle_k
 
 
 def select_prefill_torch(
@@ -70,6 +74,7 @@ def select_prefill_torch(
     topk_val: int,
     topk_ratio: float = 0.0,
     reserved_bos: int = 1,
+    reserved_eos: int = 1,
     device: Optional[torch.device] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference selection. Returns ``(kv_indptr, block_ids, block_mask)`` exactly
@@ -98,27 +103,28 @@ def select_prefill_torch(
             f"row {r}: candidate count {count} != d+1 ({d + 1}) "
             f"(i={i}, C={C}) — indptr/q_positions disagree"
         )
-        bos, middle_k = _row_budget(
-            count, topk_val=topk_val, topk_ratio=topk_ratio, reserved_bos=reserved_bos,
+        bos, eos, middle_k = _row_budget(
+            count, topk_val=topk_val, topk_ratio=topk_ratio,
+            reserved_bos=reserved_bos, reserved_eos=reserved_eos,
         )
 
         selected: list[int] = list(range(bos))     # BOS sink: blocks 0..bos-1
         if middle_k > 0:
-            # strictly-past middle candidates = local block ids [bos, d-1]
-            lo, hi = bos, d                         # exclusive hi = d (diagonal)
+            # strictly-past middle candidates = local block ids [bos, d-eos]
+            lo, hi = bos, d - eos + 1               # exclusive hi = d-eos+1
             mids = scores_flat[base + lo : base + hi]
             k = min(middle_k, hi - lo)
             if k > 0:
                 top = torch.topk(mids, k).indices.tolist()
                 selected.extend(lo + t for t in top)
+        selected.extend(range(d - eos + 1, d + 1))  # eos suffix (incl. diagonal d)
         selected = sorted(set(selected))
 
-        for c in selected:                          # strictly-past → all-ones
+        for c in selected:
             block_ids.append(c)
-            masks.append(ones_row)
-        # diagonal block d → causal-triangular (keep kv positions 0..i-d*C)
-        block_ids.append(d)
-        masks.append(p <= (i - d * C))
+            # unified mask: all-ones for strictly-past (c<d), triangular for the
+            # diagonal (c==d). p <= i - c*C is all-true when c<d (i>=d*C>(c+1)*C-1).
+            masks.append(p <= (i - c * C))
         out_indptr.append(len(block_ids))
 
     kv_indptr = torch.tensor(out_indptr, dtype=torch.int32, device=device)
@@ -141,6 +147,7 @@ def select_prefill_fast(
     topk_val: int,
     topk_ratio: float = 0.0,
     reserved_bos: int = 1,
+    reserved_eos: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Vectorized GPU selection for one query tile. Byte-identical output to
     :func:`select_prefill_torch` fed the head-major gather with
@@ -172,18 +179,21 @@ def select_prefill_fast(
     S = torch.where(valid, S, torch.full_like(S, _NEG))
 
     # --- per-row budget (mirrors _row_budget, vectorized) ---
+    # eos suffix [d-eos+1, d] (>=1 = diagonal, <= available); top-k over [bos, d-eos].
+    eos = torch.clamp(torch.full_like(num_causal, max(1, reserved_eos)), max=num_causal)
     bos = torch.where(d >= 1,
                       torch.full_like(d, reserved_bos if reserved_bos > 0 else 0),
                       torch.zeros_like(d))
-    bos = torch.minimum(bos, torch.clamp(d, min=0))
-    static = topk_val + bos + 1
+    bos = torch.minimum(bos, torch.clamp(num_causal - eos, min=0))  # no overlap w/ suffix
+    static = topk_val + bos + eos
     dynamic = torch.floor(num_causal.to(torch.float64) * topk_ratio).to(torch.int64)
     sparse_count = torch.minimum(torch.maximum(static, dynamic), num_causal)
-    middle_k = torch.clamp(sparse_count - bos - 1, min=0)
-    middle_k = torch.minimum(middle_k, torch.clamp(d - bos, min=0))
+    middle_k = torch.clamp(sparse_count - bos - eos, min=0)
+    middle_k = torch.minimum(middle_k, torch.clamp(num_causal - bos - eos, min=0))
 
-    # --- top-middle_k over the strictly-past middle [bos, d-1] ---
-    is_middle = (cols[None, :] >= bos[:, None]) & (cols[None, :] < d[:, None]) & valid
+    # --- top-middle_k over the strictly-past middle [bos, d-eos] = [bos, num_causal-eos) ---
+    suffix_lo = (num_causal - eos)                        # first reserved eos block
+    is_middle = (cols[None, :] >= bos[:, None]) & (cols[None, :] < suffix_lo[:, None]) & valid
     Smid = torch.where(is_middle, S, torch.full_like(S, _NEG))
     sorted_vals, sorted_idx = torch.sort(Smid, dim=1, descending=True)
     rank = torch.arange(max_blocks, device=device)[None, :]
@@ -192,7 +202,7 @@ def select_prefill_fast(
     sel = torch.zeros(n_rows, max_blocks, dtype=torch.bool, device=device)
     sel.scatter_(1, sorted_idx, keep)                    # middle top-k
     sel |= cols[None, :] < bos[:, None]                  # BOS sink
-    sel[ro, d] = True                                    # diagonal (always)
+    sel |= (cols[None, :] >= suffix_lo[:, None]) & valid  # eos suffix (incl. diagonal)
 
     # --- CSR assembly (nonzero → col-ascending per row, diagonal last) ---
     counts = sel.sum(dim=1)
@@ -218,6 +228,7 @@ def build_head_major_selection(
     topk_val: int,
     topk_ratio: float = 0.0,
     reserved_bos: int = 1,
+    reserved_eos: int = 1,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """P5-facing selection. The planner/indexer emit scores in **head-minor**
     global row order (``row = global_token*H_kv + kv_head``); the
@@ -259,7 +270,7 @@ def build_head_major_selection(
             torch.tensor(sub_qpos, dtype=torch.int32, device=device),
             block_size,
             topk_val=topk_val, topk_ratio=topk_ratio, reserved_bos=reserved_bos,
-            device=device,
+            reserved_eos=reserved_eos, device=device,
         )
         out.append((kv_indptr, block_ids, block_mask))
     return out

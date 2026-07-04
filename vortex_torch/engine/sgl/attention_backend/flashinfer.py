@@ -732,6 +732,7 @@ class VortexFlashInferBackend(AttentionBackend):
                     topk_val=self.ctx_prefill.topk_val,
                     topk_ratio=self.ctx_prefill.topk_ratio,
                     reserved_bos=self.ctx_prefill.block_reserved_bos,
+                    reserved_eos=self.ctx_prefill.block_reserved_eos,
                 )
                 # (4) attention: tile queries vs causal KV prefix (k/v up to token b)
                 o[s0 + a : s0 + b] = self.prefill_sparse_wrapper.run(
