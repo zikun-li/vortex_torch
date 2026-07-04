@@ -24,6 +24,22 @@ def _check_topk_io(graph: Graph, op_id: int) -> tuple[int, int]:
     return input_tensor_id, output_tensor_id
 
 
+def _generate_emit_scores_impl(graph: Graph, op_id: int) -> str:
+    """Prefill terminal lowering — "emit scores" instead of selecting.
+
+    In the sparse-prefill compile (``ctx.sparse_prefill``) the terminal
+    ``topK`` / ``approxTopK`` does NOT run the CUDA selector. It surfaces the
+    per-(row, block) RAGGED scores into the ``o`` buffer so the standalone
+    Phase-3 selection kernel (invoked from ``forward_extend``) can do the
+    causal top-k + ``(nnz,1,C)`` mask. Both buffers are RAGGED ``[max_num_blocks,
+    1, 1]``; ``copy_`` casts to ``o``'s dtype. Scores past the current batch's
+    candidate count are read by nobody (Phase-3 walks ``dense_kv_indptr``), so a
+    full-buffer copy is correct; trimming to the valid prefix is a later opt.
+    """
+    input_tensor_id, output_tensor_id = _check_topk_io(graph, op_id)
+    return f"tensor_{output_tensor_id}.copy_(tensor_{input_tensor_id})"
+
+
 def generate_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     # Pick the best-known top-k kernel at runtime via
     # ``custom_ops.find('topk_output', <backend>, max_topk_val=...)``.
@@ -43,6 +59,9 @@ def generate_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     # through :func:`vortex_torch.custom_ops.find` — bucket selection
     # picks the right ``k_<N>`` / ``default`` leaf for the JIT-compiled
     # extension.
+    if getattr(ctx, "sparse_prefill", False):
+        # Prefill compile: emit scores; Phase-3 kernel selects (see above).
+        return _generate_emit_scores_impl(graph, op_id)
     ctx.compilation_header_lines.extend([
         "from vortex_torch.custom_ops import find as _vortex_custom_ops_find",
         "_vortex_topk_kernel_cache = {}",
@@ -200,6 +219,11 @@ def generate_approx_topk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     In trtllm mode the dispatch raises NotImplementedError; an
     approx variant for trtllm/block-tables is a follow-up.
     """
+    if getattr(ctx, "sparse_prefill", False):
+        # Prefill compile: approxTopK also just emits scores — the standalone
+        # Phase-3 kernel does exact selection (tolerate_ratio ignored for now;
+        # an approx prefill lowering is a deferred follow-up).
+        return _generate_emit_scores_impl(graph, op_id)
     input_tensor_id, output_tensor_id = _check_topk_io(graph, op_id)
 
     op = graph.op_list[op_id]

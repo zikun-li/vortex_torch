@@ -39,6 +39,7 @@ def get_engine(
     vortex_schedule_policy: str | None = None,
     vortex_impl_backend: str = "triton",
     vortex_use_tensor_core: bool = False,
+    vortex_sparse_prefill: bool = False,
     kv_cache_dtype: str = "auto",
     **kwargs,
 ):
@@ -60,6 +61,7 @@ def get_engine(
         vortex_schedule_policy=policy,
         vortex_impl_backend=vortex_impl_backend,
         vortex_use_tensor_core=vortex_use_tensor_core,
+        vortex_sparse_prefill=vortex_sparse_prefill,
         vortex_dtype="bfloat16",
         vortex_compilation_cache_dir="~/.vortex_compilation_cache",
         enable_vortex_sparsity=True,
@@ -389,11 +391,16 @@ def check_engine_config(config_path: Union[str, Path]) -> Dict[str, Any]:
             f"vortex_workload_chunk_size must be a positive power of 2, got {chunk!r}"
         )
 
-    # 4. vortex_block_reserved_{bos,eos} >= 1, ints
+    # 4. vortex_block_reserved_{bos,eos} >= 1, ints. Exception: with sparse
+    #    prefill on, vortex_block_reserved_bos may be 0 (the indexer's own
+    #    score then decides whether the sink block is kept — see the prefill
+    #    topK lowering). eos still requires >= 1 (decode CUDA planner asserts it).
+    sparse_prefill = bool(config.get("vortex_sparse_prefill", False))
     for key in ("vortex_block_reserved_bos", "vortex_block_reserved_eos"):
         v = _coerce_int(config.get(key), key)
-        if v < 1:
-            raise EngineConfigError(f"{key} must be an int >= 1, got {v!r}")
+        min_v = 0 if (sparse_prefill and key == "vortex_block_reserved_bos") else 1
+        if v < min_v:
+            raise EngineConfigError(f"{key} must be an int >= {min_v}, got {v!r}")
 
     # 5. vortex_layers_skip absent/None/empty or list of ints
     layers_skip = config.get("vortex_layers_skip", None)
@@ -435,5 +442,27 @@ def check_engine_config(config_path: Union[str, Path]) -> Dict[str, Any]:
 
     # 9. Save() in indexer ⇒ disable_radix_cache must be true
     _check_disable_radix_cache(module_path, config)
+
+    # 10. Sparse prefill is fresh-prompt only this release: it feeds the
+    #     flashinfer VariableBlockSparseAttention wrapper contiguous KV and
+    #     runs the indexer per (query-token, kv-group). Chunked prefill and
+    #     radix-cache prefix reuse would introduce a cached prefix (paged
+    #     gather + merge) that the path does not yet handle, so require both
+    #     off. (extend_no_prefix is additionally asserted at runtime.)
+    if sparse_prefill:
+        if config.get("chunked_prefill_size", None) != -1:
+            raise EngineConfigError(
+                "vortex_sparse_prefill requires chunked prefill disabled: set "
+                f"\"chunked_prefill_size\": -1 (got "
+                f"{config.get('chunked_prefill_size', None)!r}). Sparse prefill "
+                "is fresh-prompt only for now."
+            )
+        if config.get("disable_radix_cache", False) is not True:
+            raise EngineConfigError(
+                "vortex_sparse_prefill requires the radix cache disabled: set "
+                "\"disable_radix_cache\": true. Otherwise a cached prompt prefix "
+                "would introduce a paged prefix the sparse-prefill path does not "
+                "yet handle (fresh-prompt only for now)."
+            )
 
     return config

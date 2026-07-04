@@ -719,7 +719,7 @@ class ServerArgs:
         "module_name": None, "block_size": 16, "topk_ratio": 0.0,
         "compilation_cache_dir": None, "schedule_policy": None,
         "attention_backend": "flashinfer", "impl_backend": "triton",
-        "use_tensor_core": False,
+        "use_tensor_core": False, "sparse_prefill": False,
     }
 
     def __getattr__(self, name):
