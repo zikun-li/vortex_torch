@@ -76,6 +76,25 @@ def get_engine(
         engine_kwargs["vortex_topk_ratio"] = vortex_topk_ratio
 
     engine_kwargs.update(kwargs)
+
+    # Enforce the sparse-prefill prerequisites here too (early, friendly error),
+    # since get_engine / get_engine_from_json bypass check_engine_config. Sparse
+    # prefill is fresh-prompt only: chunked prefill and radix-cache prefix reuse
+    # would introduce a cached prefix the path does not handle. (Also enforced at
+    # the attention-backend constructor for the CLI/server path.)
+    if vortex_sparse_prefill:
+        if engine_kwargs.get("chunked_prefill_size", None) != -1:
+            raise EngineConfigError(
+                "vortex_sparse_prefill=True requires chunked_prefill_size=-1 "
+                f"(got {engine_kwargs.get('chunked_prefill_size', None)!r}); pass "
+                "chunked_prefill_size=-1."
+            )
+        if engine_kwargs.get("disable_radix_cache", False) is not True:
+            raise EngineConfigError(
+                "vortex_sparse_prefill=True requires disable_radix_cache=True; "
+                "pass disable_radix_cache=True."
+            )
+
     return sgl.Engine(**engine_kwargs)
 
 

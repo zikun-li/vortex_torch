@@ -135,6 +135,25 @@ class VortexFlashInferBackend(AttentionBackend):
         # (prefill-shaped) indexer compile alongside the decode one; when off,
         # these stay None and ``forward_extend`` runs the existing dense path.
         self.sparse_prefill = bool(model_runner.server_args.vortex_sparse_prefill)
+        if self.sparse_prefill:
+            # Authoritative config gate (every entry path — get_engine, JSON, CLI —
+            # constructs this backend, so guarding here is unbypassable).
+            # check_engine_config validates the same, but only the benchmark
+            # runners call it; enforce at server init so unsupported chunked /
+            # radix configs can't silently mis-route to the dense path at runtime.
+            _sa = model_runner.server_args
+            if getattr(_sa, "chunked_prefill_size", None) != -1:
+                raise ValueError(
+                    "vortex_sparse_prefill requires chunked_prefill_size=-1 (got "
+                    f"{getattr(_sa, 'chunked_prefill_size', None)!r}); sparse prefill "
+                    "is fresh-prompt only."
+                )
+            if not getattr(_sa, "disable_radix_cache", False):
+                raise ValueError(
+                    "vortex_sparse_prefill requires disable_radix_cache=True; a "
+                    "cached prompt prefix would enter a paged-prefix path the "
+                    "sparse-prefill path does not handle (fresh-prompt only)."
+                )
         self.ctx_prefill: Optional[Context] = None
         self.compiled_indexer_prefill = None
         self.num_blocks_per_page = self.page_size // self.block_size
