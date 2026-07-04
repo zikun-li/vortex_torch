@@ -601,9 +601,14 @@ class VortexFlashInferBackend(AttentionBackend):
 
         q = q.contiguous()
 
-        # GQA sparse-prefill path: fresh prompt only, non-skip layers.
+        # GQA sparse-prefill path: fresh prompt only, non-skip layers, and only
+        # when save_kv_cache is set. The sparse path MUST write K/V + summaries to
+        # the pool before the indexer runs (it reads them back), so it cannot honor
+        # a no-save pass; fall back to dense (which respects save_kv_cache) instead
+        # of silently mutating cache state.
         if (
             self.sparse_prefill
+            and save_kv_cache
             and self.forward_metadata.extend_no_prefix
             and layer.layer_id not in self.layers_skip
         ):
