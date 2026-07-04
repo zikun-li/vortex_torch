@@ -167,6 +167,14 @@ class VortexSparsePrefillWrapper:
         assert kv_indptr.numel() == self.num_kv_heads * s_q + 1
 
         device = q.device
+        # The diagonal pass tiles this tile's own tokens on the LOCAL block grid,
+        # which only matches the global grid when the tile starts on a block
+        # boundary. The tile start is a = s_kv - s_q; require it block-aligned
+        # (the caller sizes query tiles to a block_size multiple).
+        assert (s_kv - s_q) % C == 0, (
+            f"query tile must start on a block boundary: (s_kv-s_q)={s_kv - s_q} "
+            f"not a multiple of C={C}"
+        )
         # Tile's own tokens = its causal-prefix suffix k[s_kv-s_q : s_kv] (tiles are
         # block-aligned, so the diagonal blocks live entirely in this suffix). Used
         # by the block-local-causal diagonal pass — capture BEFORE padding.

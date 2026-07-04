@@ -716,7 +716,15 @@ class VortexFlashInferBackend(AttentionBackend):
         bs = len(forward_batch.req_pool_indices)
         qo_cpu = self.qo_indptr[0][:bs + 1].cpu().tolist()   # ragged token ranges
         req_pool = forward_batch.req_pool_indices            # [bs]
+        # Query-tile size: bounded by the decode-planner caps (batch<=1024,
+        # eff_bs=cap*nkv<=8192), rounded DOWN to a block_size multiple so every
+        # tile start ``a=k*cap`` is block-aligned. The diagonal pass tiles the
+        # tile's own tokens on the LOCAL block grid [0,C,2C,...]; that only
+        # matches the global block grid (used by the past pass + selection) when
+        # tiles start on a block boundary, else same-block predecessors are
+        # dropped/double-counted. Rounding only shrinks cap, so caps still hold.
         cap = min(1024, 8192 // self.num_kv_heads)
+        cap = max(self.block_size, (cap // self.block_size) * self.block_size)
         cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
 
         o = torch.empty((total_tokens, Hq, Dh), dtype=q3.dtype, device=device)
