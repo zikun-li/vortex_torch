@@ -42,6 +42,9 @@ class VortexConfig:
     attention_backend: str = "flashinfer"
     impl_backend: str = "triton"
     use_tensor_core: bool = False
+    # Opt-in GQA sparse-prefill path (flashinfer VariableBlockSparseAttention).
+    # Default off preserves the historical dense-prefill behaviour exactly.
+    sparse_prefill: bool = False
 
     @classmethod
     def from_flat(cls, flat: Dict[str, Any]) -> "VortexConfig":

@@ -23,6 +23,12 @@ from vortex_torch.indexer.utils_sglang import (
     get_decode_planner,
     get_prefill_planner,
 )
+from vortex_torch.engine.sgl.attention_backend.prefill_sparse import (
+    VortexSparsePrefillWrapper,
+)
+from vortex_torch.engine.sgl.attention_backend.prefill_select import (
+    select_prefill_fast,
+)
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
 
@@ -125,6 +131,45 @@ class VortexFlashInferBackend(AttentionBackend):
         self.page_size = model_runner.server_args.page_size
         self.block_size = model_runner.server_args.vortex_block_size
         self.layers_skip = model_runner.server_args.vortex_layers_skip
+        # Opt-in GQA sparse-prefill path. When on, ``_compile`` builds a second
+        # (prefill-shaped) indexer compile alongside the decode one; when off,
+        # these stay None and ``forward_extend`` runs the existing dense path.
+        self.sparse_prefill = bool(model_runner.server_args.vortex_sparse_prefill)
+        if self.sparse_prefill:
+            # Authoritative config gate (every entry path — get_engine, JSON, CLI —
+            # constructs this backend, so guarding here is unbypassable).
+            # check_engine_config validates the same, but only the benchmark
+            # runners call it; enforce at server init so unsupported chunked /
+            # radix configs can't silently mis-route to the dense path at runtime.
+            _sa = model_runner.server_args
+            if getattr(_sa, "chunked_prefill_size", None) != -1:
+                raise ValueError(
+                    "vortex_sparse_prefill requires chunked_prefill_size=-1 (got "
+                    f"{getattr(_sa, 'chunked_prefill_size', None)!r}); sparse prefill "
+                    "is fresh-prompt only."
+                )
+            if not getattr(_sa, "disable_radix_cache", False):
+                raise ValueError(
+                    "vortex_sparse_prefill requires disable_radix_cache=True; a "
+                    "cached prompt prefix would enter a paged-prefix path the "
+                    "sparse-prefill path does not handle (fresh-prompt only)."
+                )
+            # Query tiles are block-aligned and can't be smaller than one block, so
+            # one block's queries × num_kv_heads must fit the decode planner
+            # (batch<=1024, eff_bs=cap*nkv<=8192). If block_size exceeds this per-tile
+            # cap there's no valid tile size — reject loudly rather than growing cap
+            # past the planner limit at runtime.
+            _cap = min(1024, 8192 // self.num_kv_heads)
+            if self.block_size > _cap:
+                raise ValueError(
+                    f"vortex_sparse_prefill unsupported for block_size="
+                    f"{self.block_size} with num_kv_heads={self.num_kv_heads}: a "
+                    f"query tile can't be smaller than one block, so block_size must "
+                    f"be <= min(1024, 8192//num_kv_heads)={_cap} "
+                    f"(block_size*num_kv_heads <= 8192). Reduce block_size or nkv."
+                )
+        self.ctx_prefill: Optional[Context] = None
+        self.compiled_indexer_prefill = None
         self.num_blocks_per_page = self.page_size // self.block_size
         assert self.page_size % self.block_size == 0, "Page size must be a multiple of block size."
         # ===========================
@@ -233,25 +278,61 @@ class VortexFlashInferBackend(AttentionBackend):
     
 
     def _compile(self, model_runner: "ModelRunner") -> None:
-        """Trace the sparse-attention indexer on zero-sized dummies and compile it."""
+        """Trace + compile the sparse-attention indexer.
+
+        Always compiles the **decode** indexer (``self.compiled_indexer``). When
+        ``sparse_prefill`` is on, also compiles a **prefill** indexer
+        (``self.compiled_indexer_prefill``) from the *same* ``forward_indexer``
+        against a second Context (``self.ctx_prefill``) whose leading BATCHED
+        axis is per (query-token, kv-head) and whose terminal ``topK`` emits
+        scores (the Phase-3 kernel selects). See memory ``sparse-prefill-gqa-design``.
+        """
+        self.compiled_indexer = self._trace_and_compile(
+            self.ctx, model_runner, prefill=False
+        )
+        if self.sparse_prefill:
+            self.ctx_prefill = Context()
+            self.compiled_indexer_prefill = self._trace_and_compile(
+                self.ctx_prefill, model_runner, prefill=True
+            )
+            # Preallocated fp32 score buffer (emit-scores terminal copies into it,
+            # sized to the prefill causal score-axis budget) + the exact-causal
+            # block-sparse attention wrapper (Phase 1'). bf16 only for prefill.
+            self.prefill_scores = torch.zeros(
+                (self.ctx_prefill.max_num_blocks, 1, 1),
+                dtype=torch.float32, device=model_runner.device,
+            )
+            self.prefill_sparse_wrapper = VortexSparsePrefillWrapper(
+                self.num_qo_heads, self.num_kv_heads, self.head_dim,
+                device=model_runner.device,
+                workspace_buffer=self.workspace_buffer,
+                q_data_type=self.q_data_type, kv_data_type=self.q_data_type,
+            )
+
+    def _trace_and_compile(self, ctx: "Context", model_runner: "ModelRunner",
+                           *, prefill: bool):
+        """Trace ``forward_indexer`` on zero-leading-dim dummies into ``ctx`` and
+        compile it. Shared by the decode (``prefill=False``) and sparse-prefill
+        (``prefill=True``) compiles — only the Context budgets + terminal
+        lowering differ (both driven off ``ctx.sparse_prefill``)."""
         device = model_runner.device
         dtype = self.q_data_type
         indexer = self.sparse_attention.forward_indexer
 
-        self.ctx.create(self, model_runner)
+        ctx.create(self, model_runner, prefill=prefill)
         # Allocate every per-forward-batch buffer (winfo_*, dense/sparse
-        # kv_indptr+indices, kv_last_page_len) on a single MetaData owned
-        # by the context. The decode planner writes into this MetaData;
-        # the indexer kernels read from it, and the flashinfer decode
-        # wrappers below take pointers into it.
-        self.ctx.metadata = MetaData.preallocate(self.ctx, device=device)
-        self.ctx.assert_created()
-        self.ctx.profile()
+        # kv_indptr+indices, kv_last_page_len) on a MetaData owned by the
+        # context. The planner writes into this MetaData; the indexer kernels
+        # read from it. Decode wrappers additionally take pointers into the
+        # decode ctx's MetaData.
+        ctx.metadata = MetaData.preallocate(ctx, device=device)
+        ctx.assert_created()
+        ctx.profile()
 
         def register(vt, name: str) -> None:
-            self.ctx.tensor_list.append(vt)
-            self.ctx.output_tensor_to_op_list.append(None)
-            self.ctx.tensor_id_to_tensor_name_map[vt.tensor_id] = name
+            ctx.tensor_list.append(vt)
+            ctx.output_tensor_to_op_list.append(None)
+            ctx.tensor_id_to_tensor_name_map[vt.tensor_id] = name
 
         def make_dummy(shape, fmt, tensor_id, *, tdtype=dtype, zeros=False):
             factory = torch.zeros if zeros else torch.empty
@@ -278,11 +359,12 @@ class VortexFlashInferBackend(AttentionBackend):
                 cache_dummy[name] = vt
                 register(vt, f"cache['{name}']")
 
-            indexer(q_dummy, o_dummy, cache_dummy, ctx=self.ctx)
+            indexer(q_dummy, o_dummy, cache_dummy, ctx=ctx)
 
-        self.compiled_indexer = compile_indexer(self.ctx)()
-        self.ctx.summary()
-        self.ctx.execute()
+        compiled = compile_indexer(ctx)()
+        ctx.summary()
+        ctx.execute()
+        return compiled
 
     
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -528,10 +610,25 @@ class VortexFlashInferBackend(AttentionBackend):
         
         assert not layer.is_cross_attention
         cache_loc = forward_batch.out_cache_loc
-        
+
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+
+        # GQA sparse-prefill path: fresh prompt only, non-skip layers, and only
+        # when save_kv_cache is set. The sparse path MUST write K/V + summaries to
+        # the pool before the indexer runs (it reads them back), so it cannot honor
+        # a no-save pass; fall back to dense (which respects save_kv_cache) instead
+        # of silently mutating cache state.
+        if (
+            self.sparse_prefill
+            and save_kv_cache
+            and self.forward_metadata.extend_no_prefix
+            and layer.layer_id not in self.layers_skip
+        ):
+            return self._forward_extend_sparse(
+                q, k, v, layer, forward_batch, cache_loc, logits_soft_cap
+            )
 
         if self.forward_metadata.extend_no_prefix:
             o = self.prefill_wrapper_ragged.forward(
@@ -590,6 +687,135 @@ class VortexFlashInferBackend(AttentionBackend):
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_extend_sparse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cache_loc: torch.Tensor,
+        logits_soft_cap,
+    ):
+        """GQA sparse-prefill attention (fresh prompt, non-skip layers).
+
+        Pipeline (all pieces unit-verified in tests/prefill_sparse/):
+          1. Write K/V + summaries into the pool FIRST (``set_kv_buffer`` also
+             runs ``forward_cache``) so the indexer reads the current prompt.
+          2. Per query token, a *pseudo-decode-request* (cached_seq_len = causal
+             pos+1, sharing the request's ``req_to_token`` row) → ``plan_decode``
+             on ``ctx_prefill`` populates winfo_* + causal CSR.
+          3. ``compiled_indexer_prefill`` scores each (query-token, kv-head,
+             candidate-block) and emits the RAGGED scores into ``prefill_scores``.
+          4. ``build_head_major_selection`` → per-request head-major CSR +
+             ``(nnz,1,C)`` causal mask.
+          5. Per request, per query-tile: the exact-causal block-sparse wrapper.
+
+        Query-axis chunking (Option A): each request's query axis is tiled into
+        chunks of ``<= cap = min(1024, 8192//nkv)`` tokens (the decode-planner
+        limit). Per tile the planner/indexer/selector run as one unit (they share
+        ``ctx_prefill.metadata`` + ``prefill_scores``, overwritten per tile); the
+        wrapper then attends the tile's queries to their causal KV prefix
+        (``s_q <= s_kv``). Long prompts / multi-request batches are handled by the
+        loop; nothing caps the total prompt length.
+        """
+        device = q.device
+        Hq, Hkv, Dh = layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim
+        q3 = q.view(-1, Hq, Dh)          # [tokens, Hq, D]
+        k3 = k.view(-1, Hkv, Dh)         # [tokens, Hkv, D]  (fresh prompt = full seq)
+        v3 = v.view(-1, Hkv, Dh)
+        total_tokens = q3.shape[0]
+
+        # 1) Hoist K/V + forward_cache (centroids etc.) before the indexer.
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+        )
+
+        bs = len(forward_batch.req_pool_indices)
+        qo_cpu = self.qo_indptr[0][:bs + 1].cpu().tolist()   # ragged token ranges
+        req_pool = forward_batch.req_pool_indices            # [bs]
+        # Query-tile size: bounded by the decode-planner caps (batch<=1024,
+        # eff_bs=cap*nkv<=8192), rounded DOWN to a block_size multiple so every
+        # tile start ``a=k*cap`` is block-aligned. The diagonal pass tiles the
+        # tile's own tokens on the LOCAL block grid [0,C,2C,...]; that only
+        # matches the global block grid (used by the past pass + selection) when
+        # tiles start on a block boundary, else same-block predecessors are
+        # dropped/double-counted. Rounding only shrinks cap, so caps still hold.
+        cap = min(1024, 8192 // self.num_kv_heads)
+        cap = max(self.block_size, (cap // self.block_size) * self.block_size)
+        cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+
+        o = torch.empty((total_tokens, Hq, Dh), dtype=q3.dtype, device=device)
+        for r in range(bs):
+            s0, s1 = qo_cpu[r], qo_cpu[r + 1]
+            S_r = s1 - s0
+            k_req = k3[s0:s1]            # full request K/V (fresh prompt)
+            v_req = v3[s0:s1]
+            req_idx_r = int(req_pool[r])
+            # chunk this request's query axis into <= cap-token tiles
+            for a in range(0, S_r, cap):
+                b = min(a + cap, S_r)
+                tlen = b - a
+                # Hard guard BEFORE plan_decode: plan_decode launches a CUDA kernel
+                # that WRITES dense/sparse_kv_indices + indptr + kv_last_page_len, so
+                # an oversized tile would OOB there before any post-hoc check. Verify
+                # the tile fits the preallocated buffers using an EXACT analytic count
+                # (not read from the buffers plan_decode fills): rows = tlen (<= max_bs
+                # rows of indptr/last-page) and candidate blocks = nkv * Σ_{t=a+1}^{b}
+                # ceil(t/C) (<= max_num_blocks, the score/CSR axis). Holds by
+                # construction when ΣS_q <= max_prefill_tokens; raise loudly otherwise.
+                C = self.block_size
+
+                def _cum_ceil(n, C=C):  # Σ_{t=1}^{n} ceil(t/C), closed form
+                    q, rmd = divmod(n, C)
+                    return C * q * (q + 1) // 2 + rmd * (q + 1)
+
+                n_cand = self.num_kv_heads * (_cum_ceil(b) - _cum_ceil(a))
+                if tlen > self.ctx_prefill.max_bs:
+                    raise ValueError(
+                        f"sparse prefill tile rows {tlen} exceed ctx_prefill.max_bs "
+                        f"{self.ctx_prefill.max_bs} (a={a}, b={b}); prompt exceeds "
+                        f"max_prefill_tokens."
+                    )
+                if n_cand > self.ctx_prefill.max_num_blocks:
+                    raise ValueError(
+                        f"sparse prefill tile candidate blocks {n_cand} exceed "
+                        f"max_num_blocks {self.ctx_prefill.max_num_blocks} (a={a}, "
+                        f"b={b}, S_r={S_r}); prompt exceeds max_prefill_tokens."
+                    )
+                # (1) pseudo-request plan for the tile (local causal pos+1 = a+1..b)
+                cached = torch.arange(a + 1, b + 1, device=device, dtype=torch.int32)
+                reqidx = torch.full((tlen,), req_idx_r, device=device, dtype=torch.int64)
+                self.plan_decode(
+                    cached_seq_lens=cached, req_to_token=self.req_to_token,
+                    req_indices=reqidx, ctx=self.ctx_prefill,
+                )
+                # (2) indexer → tile scores (head-minor rows = tile_token*nkv + head)
+                q_tile = q3[s0 + a : s0 + b]                    # [tlen, Hq, D]
+                q_idx = q_tile.reshape(-1, self.group_size, Dh) # [tlen*nkv, group, D]
+                self.compiled_indexer_prefill.forward(
+                    q_idx, self.prefill_scores, cache, self.ctx_prefill
+                )
+                # (3) vectorized selection → head-major CSR + (nnz,1,C) mask
+                kv_indptr, block_ids, block_mask = select_prefill_fast(
+                    self.prefill_scores,
+                    self.ctx_prefill.metadata.dense_kv_indptr,
+                    tlen, self.num_kv_heads, self.block_size, a,
+                    topk_val=self.ctx_prefill.topk_val,
+                    topk_ratio=self.ctx_prefill.topk_ratio,
+                    reserved_bos=self.ctx_prefill.block_reserved_bos,
+                    reserved_eos=self.ctx_prefill.block_reserved_eos,
+                )
+                # (4) attention: tile queries vs causal KV prefix (k/v up to token b)
+                o[s0 + a : s0 + b] = self.prefill_sparse_wrapper.run(
+                    q_tile.contiguous(),
+                    k_req[:b].contiguous(),
+                    v_req[:b].contiguous(),
+                    kv_indptr, block_ids, block_mask, self.block_size,
+                    sm_scale=layer.scaling, logits_soft_cap=logits_soft_cap,
+                )
+        return o.view(-1, Hq * Dh)
 
     def forward_decode(
         self,
