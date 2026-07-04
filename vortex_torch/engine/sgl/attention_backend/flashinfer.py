@@ -154,6 +154,20 @@ class VortexFlashInferBackend(AttentionBackend):
                     "cached prompt prefix would enter a paged-prefix path the "
                     "sparse-prefill path does not handle (fresh-prompt only)."
                 )
+            # Query tiles are block-aligned and can't be smaller than one block, so
+            # one block's queries × num_kv_heads must fit the decode planner
+            # (batch<=1024, eff_bs=cap*nkv<=8192). If block_size exceeds this per-tile
+            # cap there's no valid tile size — reject loudly rather than growing cap
+            # past the planner limit at runtime.
+            _cap = min(1024, 8192 // self.num_kv_heads)
+            if self.block_size > _cap:
+                raise ValueError(
+                    f"vortex_sparse_prefill unsupported for block_size="
+                    f"{self.block_size} with num_kv_heads={self.num_kv_heads}: a "
+                    f"query tile can't be smaller than one block, so block_size must "
+                    f"be <= min(1024, 8192//num_kv_heads)={_cap} "
+                    f"(block_size*num_kv_heads <= 8192). Reduce block_size or nkv."
+                )
         self.ctx_prefill: Optional[Context] = None
         self.compiled_indexer_prefill = None
         self.num_blocks_per_page = self.page_size // self.block_size
@@ -749,6 +763,18 @@ class VortexFlashInferBackend(AttentionBackend):
                 self.plan_decode(
                     cached_seq_lens=cached, req_to_token=self.req_to_token,
                     req_indices=reqidx, ctx=self.ctx_prefill,
+                )
+                # Hard guard: the tile's candidate-block count must fit the
+                # preallocated score / CSR buffers (max_num_blocks, sized from the
+                # whole-prompt causal bound). This holds by construction when
+                # ΣS_q ≤ max_prefill_tokens (a single tile ≤ whole-prompt sum), but
+                # is subtle — fail loudly here rather than silently OOB-writing
+                # into dense_kv_indices / prefill_scores if the invariant breaks.
+                n_cand = int(self.ctx_prefill.metadata.dense_kv_indptr[tlen * self.num_kv_heads])
+                assert n_cand <= self.ctx_prefill.max_num_blocks, (
+                    f"prefill tile candidate blocks {n_cand} exceed max_num_blocks "
+                    f"{self.ctx_prefill.max_num_blocks} (a={a}, b={b}, S_r={S_r}); "
+                    f"prompt likely exceeds max_prefill_tokens."
                 )
                 # (2) indexer → tile scores (head-minor rows = tile_token*nkv + head)
                 q_tile = q3[s0 + a : s0 + b]                    # [tlen, Hq, D]
