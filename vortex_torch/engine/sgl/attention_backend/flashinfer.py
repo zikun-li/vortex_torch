@@ -757,24 +757,39 @@ class VortexFlashInferBackend(AttentionBackend):
             for a in range(0, S_r, cap):
                 b = min(a + cap, S_r)
                 tlen = b - a
+                # Hard guard BEFORE plan_decode: plan_decode launches a CUDA kernel
+                # that WRITES dense/sparse_kv_indices + indptr + kv_last_page_len, so
+                # an oversized tile would OOB there before any post-hoc check. Verify
+                # the tile fits the preallocated buffers using an EXACT analytic count
+                # (not read from the buffers plan_decode fills): rows = tlen (<= max_bs
+                # rows of indptr/last-page) and candidate blocks = nkv * Σ_{t=a+1}^{b}
+                # ceil(t/C) (<= max_num_blocks, the score/CSR axis). Holds by
+                # construction when ΣS_q <= max_prefill_tokens; raise loudly otherwise.
+                C = self.block_size
+
+                def _cum_ceil(n, C=C):  # Σ_{t=1}^{n} ceil(t/C), closed form
+                    q, rmd = divmod(n, C)
+                    return C * q * (q + 1) // 2 + rmd * (q + 1)
+
+                n_cand = self.num_kv_heads * (_cum_ceil(b) - _cum_ceil(a))
+                if tlen > self.ctx_prefill.max_bs:
+                    raise ValueError(
+                        f"sparse prefill tile rows {tlen} exceed ctx_prefill.max_bs "
+                        f"{self.ctx_prefill.max_bs} (a={a}, b={b}); prompt exceeds "
+                        f"max_prefill_tokens."
+                    )
+                if n_cand > self.ctx_prefill.max_num_blocks:
+                    raise ValueError(
+                        f"sparse prefill tile candidate blocks {n_cand} exceed "
+                        f"max_num_blocks {self.ctx_prefill.max_num_blocks} (a={a}, "
+                        f"b={b}, S_r={S_r}); prompt exceeds max_prefill_tokens."
+                    )
                 # (1) pseudo-request plan for the tile (local causal pos+1 = a+1..b)
                 cached = torch.arange(a + 1, b + 1, device=device, dtype=torch.int32)
                 reqidx = torch.full((tlen,), req_idx_r, device=device, dtype=torch.int64)
                 self.plan_decode(
                     cached_seq_lens=cached, req_to_token=self.req_to_token,
                     req_indices=reqidx, ctx=self.ctx_prefill,
-                )
-                # Hard guard: the tile's candidate-block count must fit the
-                # preallocated score / CSR buffers (max_num_blocks, sized from the
-                # whole-prompt causal bound). This holds by construction when
-                # ΣS_q ≤ max_prefill_tokens (a single tile ≤ whole-prompt sum), but
-                # is subtle — fail loudly here rather than silently OOB-writing
-                # into dense_kv_indices / prefill_scores if the invariant breaks.
-                n_cand = int(self.ctx_prefill.metadata.dense_kv_indptr[tlen * self.num_kv_heads])
-                assert n_cand <= self.ctx_prefill.max_num_blocks, (
-                    f"prefill tile candidate blocks {n_cand} exceed max_num_blocks "
-                    f"{self.ctx_prefill.max_num_blocks} (a={a}, b={b}, S_r={S_r}); "
-                    f"prompt likely exceeds max_prefill_tokens."
                 )
                 # (2) indexer → tile scores (head-minor rows = tile_token*nkv + head)
                 q_tile = q3[s0 + a : s0 + b]                    # [tlen, Hq, D]
