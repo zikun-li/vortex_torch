@@ -63,6 +63,20 @@ pip install -e "$SGLANG_DIR"
 echo ">>> [4/4] installing vortex_torch (editable) from $REPO_ROOT"
 pip install -e "$REPO_ROOT"
 
+# ---- 4b. gt_score_kernels (editable, optional) ----------------------------
+# Only the ground-truth submission (submissions/ground_truth_kernel_topk) needs
+# it, and its ops import it lazily. Editable install from the sibling checkout
+# (not on PyPI; GitHub is tunnel-only here). Skipped with a warning if absent.
+GT_KERNELS_DIR="${GT_KERNELS_DIR:-$(dirname "$REPO_ROOT")/gt_score_kernels}"
+if [ -f "$GT_KERNELS_DIR/pyproject.toml" ]; then
+    echo ">>> [4b] installing gt_score_kernels (editable) from $GT_KERNELS_DIR"
+    pip install -e "$GT_KERNELS_DIR"
+else
+    echo ">>> [4b] gt_score_kernels not found at $GT_KERNELS_DIR — skipping."
+    echo "        (needed only for the ground_truth_kernel_topk submission;"
+    echo "         set GT_KERNELS_DIR or 'pip install -e <path>' manually.)"
+fi
+
 # ---- verify ----------------------------------------------------------------
 echo ">>> verifying the environment"
 python - <<'PY'

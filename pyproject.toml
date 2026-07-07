@@ -23,5 +23,14 @@ dependencies = [
     "unitxt",
 ]
 
+[project.optional-dependencies]
+# Ground-truth submission (submissions/ground_truth_kernel_topk) needs the fused
+# kernels in the sibling gt_score_kernels repo. Not on PyPI / GitHub is
+# tunnel-only on this host, so install it EDITABLE from the local checkout:
+#   pip install -e /data/users/zikunli/gt_score_kernels
+# (install_vortex.sh does this). The GT ops import it lazily, so this is only
+# needed when running that submission.
+gt = ["gt_score_kernels"]
+
 [tool.setuptools.packages.find]
 include = ["vortex_torch*"]

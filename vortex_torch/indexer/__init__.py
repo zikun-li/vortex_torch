@@ -54,6 +54,8 @@ attention indexers in vFlow-compatible systems.
 from .matmul import GeMM, GeMV
 from .output_func import topK, approxTopK, Union
 from .select import TopK
+from .gt_score import GTGroupScore
+from .gt_topk import GTTopK
 from .reduce import Max, Mean, Min, L2Norm, Sum
 from .scan import Softmax, Normalize, Conv1d
 from .transpose import Transpose
@@ -73,6 +75,7 @@ from .metadata import MetaData
 __all__ = [
     "GeMM", "GeMV",
     "topK", "approxTopK", "TopK", "Union",
+    "GTGroupScore", "GTTopK",
     "Max", "Mean", "Min", "L2Norm", "Sum",
     "Softmax", "Normalize", "Conv1d",
     "Transpose",
