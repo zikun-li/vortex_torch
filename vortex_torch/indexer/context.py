@@ -83,6 +83,12 @@ class Context(ContextBase):
         # need contiguous K + geometry the paged ``cache`` view and the planner
         # metadata don't carry). None until a ground-truth submission runs.
         "gt_state",
+        # Per-decode-step cache for the GT decode score path: the row->block map
+        # and candidate total derived from the (per-step-invariant) paged
+        # metadata. Recomputed once per step in ``init_forward_metadata`` and
+        # reused across all layers, avoiding a repeat_interleave + a device sync
+        # on every layer. None until a ground-truth decode step runs.
+        "gt_decode_setup",
     )
 
     # ---- type hints (declarations only) ----
@@ -141,6 +147,8 @@ class Context(ContextBase):
             elif name == "metadata":
                 object.__setattr__(self, name, None)
             elif name == "gt_state":
+                object.__setattr__(self, name, None)
+            elif name == "gt_decode_setup":
                 object.__setattr__(self, name, None)
             elif name == "sparse_prefill":
                 # Default decode; create(prefill=True) flips it. Kept a real

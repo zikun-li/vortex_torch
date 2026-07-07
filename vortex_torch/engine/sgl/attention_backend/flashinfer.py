@@ -29,6 +29,7 @@ from vortex_torch.engine.sgl.attention_backend.prefill_sparse import (
 from vortex_torch.engine.sgl.attention_backend.prefill_select import (
     select_prefill_fast,
 )
+from vortex_torch.engine.sgl.attention_backend._gtprof import gtprof
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
 
@@ -419,6 +420,20 @@ class VortexFlashInferBackend(AttentionBackend):
                 q_data_type=self.q_data_type,
                 kv_data_type=self.data_type,
             )
+            # GT decode: derive the row->block map + candidate total ONCE per
+            # step from the (per-step-invariant) dense metadata, so the per-layer
+            # score launcher skips a repeat_interleave + the int(indptr[-1].item())
+            # device sync on every layer. Read back in gt_group_score_decode.
+            if getattr(self, "gt_decode", False):
+                R = bs * self.num_kv_heads
+                indptr = self.ctx.metadata.dense_kv_indptr[:R + 1]
+                counts = indptr[1:] - indptr[:-1]
+                total = int(indptr[-1].item())
+                max_nc = int(counts.max().item()) if R > 0 else 0
+                self.ctx.gt_decode_setup = {
+                    "R": R, "total": total, "max_nc": max_nc,
+                }
+
             self.forward_metadata = DecodeMetadata([self.decode_wrappers[0], self.decode_wrappers[1]])
 
         elif forward_batch.forward_mode.is_extend():
@@ -936,23 +951,25 @@ class VortexFlashInferBackend(AttentionBackend):
                     "soft_cap": layer.logit_cap or 0.0,
                 }
 
-            # Build sparse indices into paged KV buffers
-            self.compiled_indexer.forward(
-                q=q,
-                o=self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
-                cache=cache,
-                ctx=self.ctx
-            )
+            # Build sparse indices into paged KV buffers (score + top-k select)
+            with gtprof("indexer"):
+                self.compiled_indexer.forward(
+                    q=q,
+                    o=self.forward_metadata.decode_wrappers[1]._paged_kv_indices_buf,
+                    cache=cache,
+                    ctx=self.ctx
+                )
 
             # Sparse attention compute
-            o = self.forward_metadata.decode_wrappers[1].forward(
-                q,
-                (cache_k, cache_v),
-                sm_scale=layer.scaling,
-                logits_soft_cap=layer.logit_cap,
-                k_scale=k_scale,
-                v_scale=v_scale,
-            )
+            with gtprof("attention"):
+                o = self.forward_metadata.decode_wrappers[1].forward(
+                    q,
+                    (cache_k, cache_v),
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=layer.logit_cap,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
 
         else:
             # Dense attention path

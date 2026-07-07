@@ -1,7 +1,7 @@
 """gt_topk — launcher emitter (Schedule.S, JIT-bypass terminal op).
 
 Emits a plain-Python call to the ground-truth top-k selection glue in
-``vortex_torch.engine.sgl.attention_backend.gt_prefill`` (FlashInfer
+``vortex_torch.engine.sgl.attention_backend.gt_runtime`` (FlashInfer
 ``top_k_ragged_transform`` + ``assemble_block_ids`` from ``gt_score_kernels``).
 
 Per-phase lowering (chosen at codegen time off ``ctx.sparse_prefill``):
@@ -35,7 +35,7 @@ def generate_gttopk_impl(graph: Graph, op_id: int, ctx: Context) -> str:
 
     # Prefill: our FlashInfer top-k + assemble (writes the CSR to ctx.gt_state).
     ctx.compilation_header_lines.extend([
-        "from vortex_torch.engine.sgl.attention_backend.gt_prefill import "
+        "from vortex_torch.engine.sgl.attention_backend.gt_runtime import "
         "gt_topk_prefill as _gt_topk_prefill",
     ])
     return (

@@ -1,7 +1,7 @@
 """gt_score — launcher emitter (Schedule.S, JIT-bypass).
 
 Emits a plain-Python call to the ground-truth block-score kernel in
-``vortex_torch.engine.sgl.attention_backend.gt_prefill`` (which wraps the
+``vortex_torch.engine.sgl.attention_backend.gt_runtime`` (which wraps the
 external ``gt_score_kernels`` package). No fused Triton is emitted for this op —
 this IS the "operator that bypasses vortex compilation" mechanism.
 
@@ -31,7 +31,7 @@ def generate_gtgroupscore_impl(graph: Graph, op_id: int, ctx: Context) -> str:
     )
 
     ctx.compilation_header_lines.extend([
-        "from vortex_torch.engine.sgl.attention_backend.gt_prefill import "
+        "from vortex_torch.engine.sgl.attention_backend.gt_runtime import "
         "gt_group_score_prefill as _gt_group_score_prefill, "
         "gt_group_score_decode as _gt_group_score_decode",
     ])
