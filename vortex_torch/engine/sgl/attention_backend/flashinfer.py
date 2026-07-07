@@ -290,10 +290,24 @@ class VortexFlashInferBackend(AttentionBackend):
         self.compiled_indexer = self._trace_and_compile(
             self.ctx, model_runner, prefill=False
         )
+        from vortex_torch.indexer import GTTopK
+        # Ground-truth submission (decode compile)? Its decode reference needs the
+        # model's attention scale + logit soft-cap threaded via ctx.gt_state
+        # (forward_decode sets them) so its block selection matches the real
+        # attention rather than assuming the 1/sqrt(D) default and no soft-cap.
+        self.gt_decode = any(isinstance(op, GTTopK) for op in self.ctx.op_list)
+        self.gt_prefill = False
         if self.sparse_prefill:
             self.ctx_prefill = Context()
             self.compiled_indexer_prefill = self._trace_and_compile(
                 self.ctx_prefill, model_runner, prefill=True
+            )
+            # Ground-truth submission? Its indexer is the two custom kernel ops
+            # (GTGroupScore -> GTTopK) which produce the selection directly (via
+            # gt_score_kernels), so the prefill tile loop skips plan_decode +
+            # select_prefill_fast and reads the CSR from ctx_prefill.gt_state.
+            self.gt_prefill = any(
+                isinstance(op, GTTopK) for op in self.ctx_prefill.op_list
             )
             # Preallocated fp32 score buffer (emit-scores terminal copies into it,
             # sized to the prefill causal score-axis budget) + the exact-causal
@@ -735,13 +749,13 @@ class VortexFlashInferBackend(AttentionBackend):
         bs = len(forward_batch.req_pool_indices)
         qo_cpu = self.qo_indptr[0][:bs + 1].cpu().tolist()   # ragged token ranges
         req_pool = forward_batch.req_pool_indices            # [bs]
-        # Query-tile size: bounded by the decode-planner caps (batch<=1024,
-        # eff_bs=cap*nkv<=8192), rounded DOWN to a block_size multiple so every
-        # tile start ``a=k*cap`` is block-aligned. The diagonal pass tiles the
-        # tile's own tokens on the LOCAL block grid [0,C,2C,...]; that only
-        # matches the global block grid (used by the past pass + selection) when
-        # tiles start on a block boundary, else same-block predecessors are
-        # dropped/double-counted. Rounding only shrinks cap, so caps still hold.
+        # Query-tile size (decode/compiled path): bounded by the decode-planner
+        # caps (batch<=1024, eff_bs=cap*nkv<=8192), rounded DOWN to a block_size
+        # multiple so every tile start ``a=k*cap`` is block-aligned. The diagonal
+        # pass tiles the tile's own tokens on the LOCAL block grid [0,C,2C,...];
+        # that only matches the global block grid (used by the past pass +
+        # selection) when tiles start on a block boundary, else same-block
+        # predecessors are dropped/double-counted. Rounding only shrinks cap.
         cap = min(1024, 8192 // self.num_kv_heads)
         cap = max(self.block_size, (cap // self.block_size) * self.block_size)
         cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
@@ -753,10 +767,58 @@ class VortexFlashInferBackend(AttentionBackend):
             k_req = k3[s0:s1]            # full request K/V (fresh prompt)
             v_req = v3[s0:s1]
             req_idx_r = int(req_pool[r])
-            # chunk this request's query axis into <= cap-token tiles
-            for a in range(0, S_r, cap):
-                b = min(a + cap, S_r)
+            # Tile size. The GT path does NOT use plan_decode, so it is NOT bound
+            # by the decode-planner caps (1024 / 8192) — only by the score-matrix
+            # memory (~tlen * nkv * s_blocks * 4 bytes, held to ~4 GB) and block
+            # alignment. Bigger tiles => far fewer per-KV-head wrapper plan()
+            # launches (the prefill bottleneck). The compiled path keeps the
+            # decode-planner cap.
+            if self.gt_prefill:
+                s_blocks = max(1, (S_r + self.block_size - 1) // self.block_size)
+                gt_cap = int(4.0 * 1e9 / (self.num_kv_heads * s_blocks * 4))
+                tile_cap = max(self.block_size,
+                               (gt_cap // self.block_size) * self.block_size)
+            else:
+                tile_cap = cap
+            # chunk this request's query axis into <= tile_cap-token tiles
+            for a in range(0, S_r, tile_cap):
+                b = min(a + tile_cap, S_r)
                 tlen = b - a
+                C = self.block_size
+                q_tile = q3[s0 + a : s0 + b]                    # [tlen, Hq, D]
+
+                if self.gt_prefill:
+                    # Ground-truth path: the two custom ops (GTGroupScore ->
+                    # GTTopK) run inside compiled_indexer_prefill.forward and
+                    # dispatch to gt_score_kernels (score + FlashInfer top-k +
+                    # assemble), producing the head-major CSR selection directly.
+                    # Raw per-tile K + geometry go via ctx_prefill.gt_state (our
+                    # score kernel needs a contiguous [H_kv,S,C,D] prefix, which
+                    # the paged cache / planner metadata don't carry). No
+                    # plan_decode, no select_prefill_fast.
+                    self.ctx_prefill.gt_state = {
+                        "raw_k": k_req[:b].contiguous(),   # [b, Hkv, D] causal prefix
+                        "q_offset": a,
+                        "scale": layer.scaling,
+                        "tlen": tlen,
+                    }
+                    q_idx = q_tile.reshape(-1, self.group_size, Dh)
+                    self.compiled_indexer_prefill.forward(
+                        q_idx, self.prefill_scores, cache, self.ctx_prefill
+                    )
+                    kv_indptr = self.ctx_prefill.gt_state["kv_indptr"]
+                    block_ids = self.ctx_prefill.gt_state["block_ids"]
+                    # run() ignores block_mask (diagonal-split); pass a placeholder.
+                    block_mask = torch.empty((0, 1, C), dtype=torch.bool, device=device)
+                    o[s0 + a : s0 + b] = self.prefill_sparse_wrapper.run(
+                        q_tile.contiguous(),
+                        k_req[:b].contiguous(),
+                        v_req[:b].contiguous(),
+                        kv_indptr, block_ids, block_mask, self.block_size,
+                        sm_scale=layer.scaling, logits_soft_cap=logits_soft_cap,
+                    )
+                    continue
+
                 # Hard guard BEFORE plan_decode: plan_decode launches a CUDA kernel
                 # that WRITES dense/sparse_kv_indices + indptr + kv_last_page_len, so
                 # an oversized tile would OOB there before any post-hoc check. Verify
@@ -864,6 +926,15 @@ class VortexFlashInferBackend(AttentionBackend):
         if use_sparsity:
             # Prepare Q in grouped shape expected by sparse path
             q = q.contiguous().view(-1, self.group_size, layer.head_dim)
+
+            # Ground-truth decode reference needs the model's attention scale +
+            # logit soft-cap to score/select consistently with the real decode
+            # attention (which uses layer.scaling / layer.logit_cap below).
+            if self.gt_decode:
+                self.ctx.gt_state = {
+                    "scale": layer.scaling,
+                    "soft_cap": layer.logit_cap or 0.0,
+                }
 
             # Build sparse indices into paged KV buffers
             self.compiled_indexer.forward(

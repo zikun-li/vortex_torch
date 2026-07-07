@@ -76,6 +76,13 @@ class Context(ContextBase):
         # into ``o`` instead of selecting — the standalone Phase-3 kernel does
         # the causal top-k + mask afterward). Default False = decode, unchanged.
         "sparse_prefill",
+        # ---- ground-truth op runtime side-channel ----
+        # A plain dict the engine (``_forward_extend_sparse``) fills per query
+        # tile with the raw per-tile K, query offset, scale, and tile length,
+        # which the GTGroupScore/GTTopK custom-kernel launchers read from (they
+        # need contiguous K + geometry the paged ``cache`` view and the planner
+        # metadata don't carry). None until a ground-truth submission runs.
+        "gt_state",
     )
 
     # ---- type hints (declarations only) ----
@@ -132,6 +139,8 @@ class Context(ContextBase):
             elif name == "mode":
                 object.__setattr__(self, name, Mode.profile)
             elif name == "metadata":
+                object.__setattr__(self, name, None)
+            elif name == "gt_state":
                 object.__setattr__(self, name, None)
             elif name == "sparse_prefill":
                 # Default decode; create(prefill=True) flips it. Kept a real
