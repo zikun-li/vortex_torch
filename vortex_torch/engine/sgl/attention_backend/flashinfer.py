@@ -573,8 +573,23 @@ class VortexFlashInferBackend(AttentionBackend):
                 kv_data_type=self.data_type,
             )
             
+            # GT decode under CUDA graph: sglang captures with seq_len=1
+            # (get_cuda_graph_seq_len_fill_value), so we CANNOT size the score
+            # grid from the capture-time metadata. Size it for the MAX context
+            # (max_num_blocks_per_request) so the baked grid + logits scratch
+            # cover any replay seq_len; the score kernel masks per-row via the
+            # (replay-updated) dense_kv_indptr, so shorter sequences are correct.
+            # total = R*max_nc is the worst case and is <= max_num_blocks (the
+            # score buffer capacity). No .item() here -> capture stays sync-free.
+            if getattr(self, "gt_decode", False):
+                R = bs * self.num_kv_heads
+                max_nc = int(self.ctx.max_num_blocks_per_request)
+                self.ctx.gt_decode_setup = {
+                    "R": R, "total": R * max_nc, "max_nc": max_nc,
+                }
+
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
-            self.forward_metadata = DecodeMetadata(decode_wrappers)             
+            self.forward_metadata = DecodeMetadata(decode_wrappers)
         else:
             raise NotImplementedError
             
