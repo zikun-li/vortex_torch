@@ -61,6 +61,10 @@ def gt_group_score_prefill(q, k, score_out, ctx) -> None:
 
     q4 = q.reshape(tlen, H_kv, G, D)                 # token-major, head-minor
     k4 = _keys_to_hscd(st["raw_k"], C)               # [H_kv, S, C, D]
+    # NOTE: scale is the model's layer.scaling (threaded via gt_state), but the
+    # Triton score kernel does not apply a logit soft-cap. For soft-cap models
+    # (layer.logit_cap>0) prefill selection is scored on uncapped logits — a
+    # kernel limitation (follow-up). Qwen3 has no soft-cap, so it's exact there.
     scores = group_scores_prefill(
         q4, k4, scale=st["scale"], block_size=C, q_pos0=st["q_offset"],
     )                                                # [tlen, H_kv, S] fp32
@@ -134,7 +138,12 @@ def gt_group_score_decode(q, k, score_out, ctx) -> None:
     if R == 0:
         return
     dev = q.device
-    scale = 1.0 / math.sqrt(D)
+    # Scale + logit soft-cap come from the model's attention layer (threaded via
+    # ctx.gt_state in forward_decode) so the selection matches the real decode
+    # attention. Fall back to the 1/sqrt(D) default + no cap if unset.
+    st = ctx.gt_state or {}
+    scale = st.get("scale", 1.0 / math.sqrt(D))
+    soft_cap = st.get("soft_cap", 0.0)
 
     indptr = md.dense_kv_indptr[: R + 1].to(torch.int64)          # [R+1]
     indices = md.dense_kv_indices                                 # [total] paged block ids
@@ -152,6 +161,8 @@ def gt_group_score_decode(q, k, score_out, ctx) -> None:
 
     Kc = kv[cand].to(torch.float32)                              # [R, max_nc, C, D]
     logits = torch.einsum("rgd,rncd->rgnc", q3, Kc) * scale      # [R, G, max_nc, C]
+    if soft_cap and soft_cap > 0:                                # Gemma2-style cap
+        logits = soft_cap * torch.tanh(logits / soft_cap)
 
     # token-validity: block valid AND (not-last-block OR token < last_page_len).
     is_last = (col[None, :] == (counts[:, None] - 1))            # [R, max_nc]

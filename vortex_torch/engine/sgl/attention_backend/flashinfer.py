@@ -290,6 +290,12 @@ class VortexFlashInferBackend(AttentionBackend):
         self.compiled_indexer = self._trace_and_compile(
             self.ctx, model_runner, prefill=False
         )
+        from vortex_torch.indexer import GTTopK
+        # Ground-truth submission (decode compile)? Its decode reference needs the
+        # model's attention scale + logit soft-cap threaded via ctx.gt_state
+        # (forward_decode sets them) so its block selection matches the real
+        # attention rather than assuming the 1/sqrt(D) default and no soft-cap.
+        self.gt_decode = any(isinstance(op, GTTopK) for op in self.ctx.op_list)
         self.gt_prefill = False
         if self.sparse_prefill:
             self.ctx_prefill = Context()
@@ -300,7 +306,6 @@ class VortexFlashInferBackend(AttentionBackend):
             # (GTGroupScore -> GTTopK) which produce the selection directly (via
             # gt_score_kernels), so the prefill tile loop skips plan_decode +
             # select_prefill_fast and reads the CSR from ctx_prefill.gt_state.
-            from vortex_torch.indexer import GTTopK
             self.gt_prefill = any(
                 isinstance(op, GTTopK) for op in self.ctx_prefill.op_list
             )
@@ -921,6 +926,15 @@ class VortexFlashInferBackend(AttentionBackend):
         if use_sparsity:
             # Prepare Q in grouped shape expected by sparse path
             q = q.contiguous().view(-1, self.group_size, layer.head_dim)
+
+            # Ground-truth decode reference needs the model's attention scale +
+            # logit soft-cap to score/select consistently with the real decode
+            # attention (which uses layer.scaling / layer.logit_cap below).
+            if self.gt_decode:
+                self.ctx.gt_state = {
+                    "scale": layer.scaling,
+                    "soft_cap": layer.logit_cap or 0.0,
+                }
 
             # Build sparse indices into paged KV buffers
             self.compiled_indexer.forward(
