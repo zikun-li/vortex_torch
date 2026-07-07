@@ -18,13 +18,16 @@ The raw per-tile K and geometry come via ``ctx.gt_state`` (set by
 ``[H_kv, S, C, D]`` key prefix, which neither the paged ``cache`` view nor the
 planner metadata provides directly.
 
-Decode ground-truth kernels do not exist yet; the decode lowerings raise a clear
-error until they land (this session is prefill-only; see the plan).
+Data flow (decode): the compiled indexer runs ``gt_group_score_decode`` (exact
+group-level block scores over the paged cache) followed by the built-in exact
+top-k selector.
 """
 
 import math
 
 import torch
+
+from vortex_torch.engine.sgl.attention_backend._gtprof import gtprof
 
 
 def _keys_to_hscd(raw_k: torch.Tensor, C: int) -> torch.Tensor:
@@ -120,18 +123,68 @@ def gt_topk_prefill(score_in, o, ctx) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Decode: correctness-first torch REFERENCE (a fast GT decode kernel is future
-# work). Computes the exact group-level block score for every decode row over the
-# paged cache, in the head-minor CSR layout the built-in top-k selector reads
-# (GTTopK decode reuses that selector). Vectorized (padded-ragged) to avoid a
-# per-row python loop; still a reference — expect it to be the decode bottleneck.
+# Decode: fast group-level block scores via the Triton kernel
+# ``gt_score_kernels.group_scores_decode`` (one QK matmul pass to an HBM logits
+# scratch, then a per-row reduction), writing one score per candidate block into
+# ``score_out`` in the head-minor CSR layout the built-in top-k selector reads.
+# The vectorized torch ``_gt_group_score_decode_ref`` below is retained as the
+# correctness oracle (unit test + optional in-engine cross-check).
 # --------------------------------------------------------------------------- #
 def gt_group_score_decode(q, k, score_out, ctx) -> None:
-    """GTGroupScore decode reference. ``q`` = ``[B*H_kv, group, D]`` (row =
-    request*H_kv + kv_head, head-minor); ``k`` = paged ``cache["k"]``. Writes one
-    exact block score per candidate into ``score_out`` at the row's
-    ``dense_kv_indptr`` slot (sum over the GQA group of the true softmax weights,
-    max over the block tokens), matching the ``naive_ground_truth_topk`` math."""
+    """GTGroupScore decode. ``q`` = ``[B*H_kv, group, D]`` (row = request*H_kv +
+    kv_head, head-minor); ``k`` = paged ``cache["k"]``. Dispatches to the Triton
+    ``group_scores_decode`` kernel and writes one exact block score per candidate
+    into ``score_out`` at the row's ``dense_kv_indptr`` slot (sum over the GQA
+    group of the true softmax weights, max over block tokens). Matches
+    ``_gt_group_score_decode_ref`` / the ``naive_ground_truth_topk`` math."""
+    from gt_score_kernels.group_score_topk.decode import group_scores_decode
+
+    md = ctx.metadata
+    C, D, G = ctx.block_size, ctx.head_dim, ctx.group_size
+    R = int(md.batch_size) * ctx.num_kv_heads
+    if R == 0:
+        return
+    # Scale + logit soft-cap come from the model's attention layer (threaded via
+    # ctx.gt_state in forward_decode). Fall back to 1/sqrt(D) + no cap if unset.
+    st = ctx.gt_state or {}
+    scale = st.get("scale", 1.0 / math.sqrt(D))
+    soft_cap = st.get("soft_cap", 0.0)
+
+    indptr = md.dense_kv_indptr[: R + 1]                          # [R+1] CSR offsets
+    indices = md.dense_kv_indices                                 # [total] paged block ids
+    last_len = md.kv_last_page_len[:R]                            # [R]
+    paged_k = k.reshape(-1, C, D)                                 # [num_blocks, C, D]
+    q3 = q.reshape(R, G, D)                                       # [R, G, D]
+
+    # Per-step setup (candidate total + row->block map) is computed once in
+    # init_forward_metadata and reused across layers — avoids a repeat_interleave
+    # and a device sync here on every layer. Fall back to computing it inline if
+    # absent (e.g. a code path that didn't populate the cache).
+    setup = ctx.gt_decode_setup
+    if setup is not None and setup.get("R") == R:
+        total = setup["total"]
+        max_nc = setup["max_nc"]
+    else:
+        total = int(indptr[-1].item())
+        max_nc = None
+    if total == 0:
+        return
+    # CSR positions are the dense range [0, total); score_out is indexed by them
+    # (same slots the decode top-k selector reads via dense_kv_indptr).
+    with gtprof("score"):
+        scores = group_scores_decode(
+            q3, paged_k, indptr, indices, last_len,
+            scale=scale, block_size=C, soft_cap=soft_cap,
+            total=total, max_nc=max_nc,
+        )                                                        # [total] fp32, CSR order
+        score_out.view(-1)[:total] = scores.to(score_out.dtype)
+
+
+def _gt_group_score_decode_ref(q, k, score_out, ctx) -> None:
+    """Correctness ORACLE for :func:`gt_group_score_decode` — the original
+    vectorized (padded-ragged) torch exact-softmax over the paged cache. Kept for
+    the unit test and an optional in-engine cross-check; slow (materializes
+    ``[R, max_nc, C, D]``), so not used on the hot decode path."""
     md = ctx.metadata
     C, D, G = ctx.block_size, ctx.head_dim, ctx.group_size
     R = int(md.batch_size) * ctx.num_kv_heads
