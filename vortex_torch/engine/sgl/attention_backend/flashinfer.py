@@ -67,6 +67,27 @@ class PrefillMetadata:
 global_workspace_buffer = None
 
 
+# --- GT correctness-test dump hook (active only when SAB_GT_DUMP_DIR is set) --------------------
+_GT_DUMP_DIR = os.environ.get("SAB_GT_DUMP_DIR")
+_GT_DUMP_CTR = {}
+# decode dumps gather candidate K (large at long ctx) -> only for layers < this cap (0 = off)
+_GT_DUMP_DEC_LAYERS = int(os.environ.get("SAB_GT_DUMP_DECODE_LAYERS", "0"))
+
+
+def _gt_dump(subdir, key, **tensors):
+    """Save selected-pattern + Q/K tensors for the vortex-vs-reference correctness test.
+    No-op unless SAB_GT_DUMP_DIR is set. Tensors are detached to CPU to spare GPU memory."""
+    if not _GT_DUMP_DIR:
+        return
+    import os as _os
+    d = _os.path.join(_GT_DUMP_DIR, subdir)
+    _os.makedirs(d, exist_ok=True)
+    n = _GT_DUMP_CTR.get(key, 0)
+    _GT_DUMP_CTR[key] = n + 1
+    payload = {k: (v.detach().to("cpu") if hasattr(v, "detach") else v) for k, v in tensors.items()}
+    torch.save(payload, _os.path.join(d, f"{key}_{n}.pt"))
+
+
 class VortexFlashInferBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -129,6 +150,8 @@ class VortexFlashInferBackend(AttentionBackend):
         
         # Assign key configuration and parameters
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # sglang 0.5.13: the KV pool lives on model_runner, not ForwardBatch.
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.page_size = model_runner.server_args.page_size
         self.block_size = model_runner.server_args.vortex_block_size
         self.layers_skip = model_runner.server_args.vortex_layers_skip
@@ -638,8 +661,40 @@ class VortexFlashInferBackend(AttentionBackend):
             kv_data_type=self.data_type,
         )
 
+    def init_forward_metadata_out_graph(self, forward_batch: ForwardBatch, in_capture: bool = False):
+        """sglang 0.5.13 renamed the cuda-graph metadata hooks from
+        ``init_forward_metadata_{capture,replay}_cuda_graph`` to
+        ``init_forward_metadata_{out,in}_graph``; without this override the base no-op ran and
+        ``self.forward_metadata`` was never set at capture -> forward_decode saw None. This runs
+        OUTSIDE the captured graph (host ops OK): capture (in_capture=True) creates+plans the decode
+        wrappers and sets forward_metadata so the recorded forward_decode sees them; replay
+        (in_capture=False) re-plans for the actual seq_lens. Delegates to the existing capture/replay
+        bodies to avoid divergence."""
+        fb = forward_batch
+        assert fb.forward_mode.is_decode_or_idle()
+        bs = int(getattr(fb, "batch_size", None) or len(fb.req_pool_indices))
+        if in_capture:
+            self.init_forward_metadata_capture_cuda_graph(
+                bs, num_tokens=bs, req_pool_indices=fb.req_pool_indices, seq_lens=fb.seq_lens,
+                encoder_lens=getattr(fb, "encoder_lens", None), forward_mode=fb.forward_mode,
+                spec_info=getattr(fb, "spec_info", None),
+            )
+        else:
+            self.init_forward_metadata_replay_cuda_graph(
+                bs, req_pool_indices=fb.req_pool_indices, seq_lens=fb.seq_lens,
+                seq_lens_sum=int(getattr(fb, "seq_lens_sum", 0) or 0),
+                encoder_lens=getattr(fb, "encoder_lens", None), forward_mode=fb.forward_mode,
+                spec_info=getattr(fb, "spec_info", None), seq_lens_cpu=getattr(fb, "seq_lens_cpu", None),
+            )
+            self.forward_metadata = DecodeMetadata(self.decode_cuda_graph_metadata[bs])
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        # Planning/selection metadata is host-side (out_graph). The GT indexer + sparse attention
+        # are recorded via the model's forward_decode during capture, so nothing extra to record.
+        pass
+
     def get_cuda_graph_seq_len_fill_value(self):
-        
+
         return 1
 
     def forward_extend(
@@ -704,7 +759,7 @@ class VortexFlashInferBackend(AttentionBackend):
             )
             
             
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             k_cache = k_cache.view(-1, self.page_size, 1, self.head_dim)
             v_cache = v_cache.view(-1, self.page_size, 1, self.head_dim)
             o2, s2 = self.prefill_wrapper_paged.forward_return_lse(
@@ -726,7 +781,7 @@ class VortexFlashInferBackend(AttentionBackend):
             o, _ = merge_state(o1, s1, o2_t, s2_t)
 
         if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
@@ -772,7 +827,7 @@ class VortexFlashInferBackend(AttentionBackend):
         total_tokens = q3.shape[0]
 
         # 1) Hoist K/V + forward_cache (centroids etc.) before the indexer.
-        forward_batch.token_to_kv_pool.set_kv_buffer(
+        self.token_to_kv_pool.set_kv_buffer(
             layer, cache_loc, k, v, layer.k_scale, layer.v_scale
         )
 
@@ -788,7 +843,7 @@ class VortexFlashInferBackend(AttentionBackend):
         # predecessors are dropped/double-counted. Rounding only shrinks cap.
         cap = min(1024, 8192 // self.num_kv_heads)
         cap = max(self.block_size, (cap // self.block_size) * self.block_size)
-        cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+        cache = self.token_to_kv_pool.get_cache(layer.layer_id)
 
         o = torch.empty((total_tokens, Hq, Dh), dtype=q3.dtype, device=device)
         for r in range(bs):
@@ -838,6 +893,13 @@ class VortexFlashInferBackend(AttentionBackend):
                     )
                     kv_indptr = self.ctx_prefill.gt_state["kv_indptr"]
                     block_ids = self.ctx_prefill.gt_state["block_ids"]
+                    _gt_dump("prefill", f"L{layer.layer_id}_s{s0}_a{a}",
+                             layer_id=layer.layer_id, q_offset=a, tlen=tlen, s0=s0,
+                             num_kv_heads=self.num_kv_heads, group_size=self.group_size,
+                             block_size=C, scale=float(layer.scaling),
+                             raw_k=k_req[:b], q_tile=q_tile,   # .to(cpu) in _gt_dump; no GPU copy
+                             scores=self.ctx_prefill.gt_state.get("scores"),
+                             kv_indptr=kv_indptr, block_ids=block_ids)
                     # run() ignores block_mask (diagonal-split); pass a placeholder.
                     block_mask = torch.empty((0, 1, C), dtype=torch.bool, device=device)
                     o[s0 + a : s0 + b] = self.prefill_sparse_wrapper.run(
@@ -931,12 +993,12 @@ class VortexFlashInferBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
         # Read Cache from memory pool
-        cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+        cache = self.token_to_kv_pool.get_cache(layer.layer_id)
         
         cache_k = cache["k"].view(-1, self.block_size, 1, self.head_dim)
         cache_v = cache["v"].view(-1, self.block_size, 1, self.head_dim)
@@ -974,6 +1036,20 @@ class VortexFlashInferBackend(AttentionBackend):
                     cache=cache,
                     ctx=self.ctx
                 )
+
+            if _GT_DUMP_DIR and layer.layer_id < _GT_DUMP_DEC_LAYERS:
+                md = self.ctx.metadata
+                R = int(md.batch_size) * self.num_kv_heads
+                dkptr = md.dense_kv_indptr[:R + 1]
+                _gt_dump("decode", f"L{layer.layer_id}",
+                         layer_id=layer.layer_id, num_kv_heads=self.num_kv_heads,
+                         group_size=self.group_size, block_size=self.block_size,
+                         scale=float(layer.scaling), q=q.contiguous(),
+                         dense_kv_indptr=dkptr, dense_kv_indices=md.dense_kv_indices,
+                         kv_last_page_len=md.kv_last_page_len[:R],
+                         sparse_kv_indptr=md.sparse_kv_indptr[:R + 1],
+                         sparse_kv_indices=md.sparse_kv_indices,
+                         cand_k=cache_k[md.dense_kv_indices].contiguous())
 
             # Sparse attention compute
             with gtprof("attention"):
