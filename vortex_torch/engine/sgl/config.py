@@ -17,7 +17,60 @@ Two entry points populate it:
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
+
+
+@dataclass
+class PrefillPatchConfig:
+    """Analysis-only capture/patch configuration for one fresh prefill request.
+
+    ``capture_dense`` writes post-QK-norm/RoPE Q/K and projected V.
+    ``capture_sparse`` writes the GT selection for the final query block.
+    ``apply`` reads both traces and replaces only the final query row.
+    """
+
+    mode: Literal["capture_dense", "capture_sparse", "apply"]
+    output_dir: str
+    dense_trace_dir: Optional[str] = None
+    sparse_trace_dir: Optional[str] = None
+    components: Literal["q", "kv", "qkv"] = "qkv"
+    routing: Literal["frozen", "recompute"] = "frozen"
+    layers: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"capture_dense", "capture_sparse", "apply"}:
+            raise ValueError(f"unknown prefill patch mode: {self.mode!r}")
+        if not isinstance(self.output_dir, str) or not self.output_dir:
+            raise ValueError("prefill patch output_dir must be a non-empty string")
+        if self.components not in {"q", "kv", "qkv"}:
+            raise ValueError(f"unknown prefill patch components: {self.components!r}")
+        if self.routing not in {"frozen", "recompute"}:
+            raise ValueError(f"unknown prefill patch routing: {self.routing!r}")
+        if self.mode == "apply":
+            if not self.dense_trace_dir or not self.sparse_trace_dir:
+                raise ValueError(
+                    "prefill patch apply mode requires dense_trace_dir and "
+                    "sparse_trace_dir"
+                )
+        if self.layers is not None:
+            if not isinstance(self.layers, list) or any(
+                isinstance(x, bool) or not isinstance(x, int) or x < 0
+                for x in self.layers
+            ):
+                raise ValueError("prefill patch layers must be a list of non-negative ints")
+            if len(set(self.layers)) != len(self.layers):
+                raise ValueError("prefill patch layers must not contain duplicates")
+
+    @classmethod
+    def from_value(cls, value: Any) -> "PrefillPatchConfig":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(**value)
+        raise TypeError(
+            "vortex_prefill_patch must be a PrefillPatchConfig or mapping, "
+            f"got {type(value).__name__}"
+        )
 
 
 @dataclass
@@ -45,6 +98,12 @@ class VortexConfig:
     # Opt-in GQA sparse-prefill path (flashinfer VariableBlockSparseAttention).
     # Default off preserves the historical dense-prefill behaviour exactly.
     sparse_prefill: bool = False
+    # Analysis-only target-row capture/patch support. None has zero runtime cost.
+    prefill_patch: Optional[PrefillPatchConfig] = None
+
+    def __post_init__(self) -> None:
+        if self.prefill_patch is not None:
+            self.prefill_patch = PrefillPatchConfig.from_value(self.prefill_patch)
 
     @classmethod
     def from_flat(cls, flat: Dict[str, Any]) -> "VortexConfig":
@@ -54,6 +113,8 @@ class VortexConfig:
         for k, v in flat.items():
             key = k[len("vortex_"):] if k.startswith("vortex_") else k
             if key in names:
+                if key == "prefill_patch" and v is not None:
+                    v = PrefillPatchConfig.from_value(v)
                 kw[key] = v
         return cls(**kw)
 

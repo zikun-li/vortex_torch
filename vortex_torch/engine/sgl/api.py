@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional, Union
 
 import sglang as sgl
 
+from vortex_torch.engine.sgl.config import PrefillPatchConfig
+
 
 DEFAULT_SCHEDULE_POLICY = r"""
 const int static_kv_budget = topk_val + block_reserved_bos + block_reserved_eos;
@@ -40,6 +42,7 @@ def get_engine(
     vortex_impl_backend: str = "triton",
     vortex_use_tensor_core: bool = False,
     vortex_sparse_prefill: bool = False,
+    vortex_prefill_patch: PrefillPatchConfig | dict | None = None,
     kv_cache_dtype: str = "auto",
     **kwargs,
 ):
@@ -62,6 +65,7 @@ def get_engine(
         vortex_impl_backend=vortex_impl_backend,
         vortex_use_tensor_core=vortex_use_tensor_core,
         vortex_sparse_prefill=vortex_sparse_prefill,
+        vortex_prefill_patch=vortex_prefill_patch,
         vortex_dtype="bfloat16",
         vortex_compilation_cache_dir="~/.vortex_compilation_cache",
         enable_vortex_sparsity=True,

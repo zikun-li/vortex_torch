@@ -21,6 +21,7 @@ dependencies = [
     "beautifulsoup4",
     "accelerate",
     "unitxt",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -34,3 +35,8 @@ gt = ["gt_score_kernels"]
 
 [tool.setuptools.packages.find]
 include = ["vortex_torch*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: opt-in real-model GPU integration test",
+]

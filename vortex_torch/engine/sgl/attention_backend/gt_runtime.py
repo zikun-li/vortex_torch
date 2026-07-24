@@ -44,6 +44,68 @@ def _keys_to_hscd(raw_k: torch.Tensor, C: int) -> torch.Tensor:
     return raw_k.view(S, C, h_kv, d).permute(2, 0, 1, 3).contiguous()  # [H_kv,S,C,D]
 
 
+def gt_prefill_scores(
+    q: torch.Tensor,
+    raw_k: torch.Tensor,
+    *,
+    block_size: int,
+    q_offset: int,
+    scale: float,
+) -> torch.Tensor:
+    """Return exact GT group scores for ``q`` in ``[T,H_kv,G,D]`` layout."""
+    from gt_score_kernels.group_score_topk.prefill import group_scores_prefill
+
+    return group_scores_prefill(
+        q,
+        _keys_to_hscd(raw_k, block_size),
+        scale=scale,
+        block_size=block_size,
+        q_pos0=q_offset,
+    )
+
+
+def gt_prefill_select(
+    scores: torch.Tensor,
+    *,
+    block_size: int,
+    q_offset: int,
+    topk_val: int,
+    reserved_bos: int,
+    reserved_eos: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select a head-major GT CSR from ``[T,H_kv,S]`` scores."""
+    import flashinfer.topk as fitk
+    from gt_score_kernels.group_score_topk.assemble import assemble_block_ids
+
+    tlen, H_kv, S = scores.shape
+    dev = scores.device
+    C = block_size
+    bos, eos = reserved_bos, reserved_eos
+    k_blocks = max(1, int(topk_val))
+
+    sf = scores.permute(1, 0, 2).reshape(H_kv * tlen, S).to(torch.float32)
+    R = sf.shape[0]
+    j = torch.arange(R, device=dev) % tlen
+    q_pos = q_offset + j
+    d = q_pos // C
+    n_blocks = (d + 1).to(torch.int32)
+    n_mid = (n_blocks - eos - bos).clamp(min=0)
+    k_take = torch.minimum(torch.full_like(n_mid, k_blocks), n_mid)
+
+    inp = sf[:, bos:]
+    if inp.shape[1] < k_blocks:
+        pad = torch.full((R, k_blocks - inp.shape[1]), float("-inf"), device=dev)
+        inp = torch.cat([inp, pad], dim=1)
+    lengths = n_mid.clamp(min=1).to(torch.int32)
+    offsets = torch.full((R,), bos, dtype=torch.int32, device=dev)
+    out_mid = fitk.top_k_ragged_transform(inp.contiguous(), offsets, lengths, k_blocks)
+
+    block_ids, kv_indptr, _ = assemble_block_ids(
+        out_mid, n_blocks, k_take, bos=bos, eos=eos, k_blocks=k_blocks,
+    )
+    return block_ids, kv_indptr
+
+
 def gt_group_score_prefill(q, k, score_out, ctx) -> None:
     """GTGroupScore prefill launcher: exact group-level block scores via
     ``gt_score_kernels.group_scores_prefill``. Stashes the dense
@@ -55,21 +117,22 @@ def gt_group_score_prefill(q, k, score_out, ctx) -> None:
     intermediate buffer) is unused — the score is passed to GTTopK via
     ``ctx.gt_state`` to avoid a layout round-trip through the RAGGED
     ``[max_num_blocks,1,1]`` buffer."""
-    from gt_score_kernels.group_score_topk.prefill import group_scores_prefill
-
     st = ctx.gt_state
     C = ctx.block_size
     H_kv, G, D = ctx.num_kv_heads, ctx.group_size, ctx.head_dim
     tlen = st["tlen"]
 
     q4 = q.reshape(tlen, H_kv, G, D)                 # token-major, head-minor
-    k4 = _keys_to_hscd(st["raw_k"], C)               # [H_kv, S, C, D]
     # NOTE: scale is the model's layer.scaling (threaded via gt_state), but the
     # Triton score kernel does not apply a logit soft-cap. For soft-cap models
     # (layer.logit_cap>0) prefill selection is scored on uncapped logits — a
     # kernel limitation (follow-up). Qwen3 has no soft-cap, so it's exact there.
-    scores = group_scores_prefill(
-        q4, k4, scale=st["scale"], block_size=C, q_pos0=st["q_offset"],
+    scores = gt_prefill_scores(
+        q4,
+        st["raw_k"],
+        block_size=C,
+        q_offset=st["q_offset"],
+        scale=st["scale"],
     )                                                # [tlen, H_kv, S] fp32
     st["scores"] = scores
 
@@ -84,39 +147,16 @@ def gt_topk_prefill(score_in, o, ctx) -> None:
     wrapper's HEAD-MAJOR row layout (head ``g`` owns rows ``[g*tlen,(g+1)*tlen)``)
     and honoring the reserved BOS/EOS convention (fixed-k budget; ``topk_ratio``
     support is a follow-up)."""
-    import flashinfer.topk as fitk
-    from gt_score_kernels.group_score_topk.assemble import assemble_block_ids
-
     st = ctx.gt_state
     scores = st["scores"]                            # [tlen, H_kv, S] fp32
-    tlen, H_kv, S = scores.shape
-    dev = scores.device
     C = ctx.block_size
-    bos, eos = ctx.block_reserved_bos, ctx.block_reserved_eos
-    k_blocks = max(1, int(ctx.topk_val))
-    a = st["q_offset"]
-
-    # Head-major rows: row r -> head g=r//tlen, tile-local token j=r%tlen.
-    sf = scores.permute(1, 0, 2).reshape(H_kv * tlen, S).to(torch.float32)  # [R,S]
-    R = sf.shape[0]
-    j = torch.arange(R, device=dev) % tlen
-    q_pos = a + j
-    d = q_pos // C
-    n_blocks = (d + 1).to(torch.int32)               # causal blocks per row
-    n_mid = (n_blocks - eos - bos).clamp(min=0)
-    k_take = torch.minimum(torch.full_like(n_mid, k_blocks), n_mid)
-
-    # FlashInfer ragged top-k over the strictly-past middle [bos, d-eos].
-    inp = sf[:, bos:]
-    if inp.shape[1] < k_blocks:
-        pad = torch.full((R, k_blocks - inp.shape[1]), float("-inf"), device=dev)
-        inp = torch.cat([inp, pad], dim=1)
-    lengths = n_mid.clamp(min=1).to(torch.int32)
-    offsets = torch.full((R,), bos, dtype=torch.int32, device=dev)
-    out_mid = fitk.top_k_ragged_transform(inp.contiguous(), offsets, lengths, k_blocks)
-
-    block_ids, kv_indptr, _ = assemble_block_ids(
-        out_mid, n_blocks, k_take, bos=bos, eos=eos, k_blocks=k_blocks,
+    block_ids, kv_indptr = gt_prefill_select(
+        scores,
+        block_size=C,
+        q_offset=st["q_offset"],
+        topk_val=ctx.topk_val,
+        reserved_bos=ctx.block_reserved_bos,
+        reserved_eos=ctx.block_reserved_eos,
     )
     st["kv_indptr"] = kv_indptr
     st["block_ids"] = block_ids
