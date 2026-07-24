@@ -42,10 +42,11 @@ def _install_probe():
         return
 
     out_path = os.environ.get("VORTEX_TIME_OUT")
-    # Shared mutable state: which layer is currently executing, a per-method
-    # tile counter (prefill fires the indexer once per query-tile), and a
+    # Shared mutable state: which layer is currently executing, a per-regime
+    # tile counter (each regime fires the indexer once per query-tile), and a
     # monotonic sequence id for warmup discarding.
-    state = {"layer": -1, "tile": 0, "seq": 0}
+    state = {"layer": -1, "tile": {"decode": 0, "prefill": 0, "prefill_select": 0},
+             "seq": 0}
 
     def _emit(regime, layer, ms, tile, seq):
         rec = {
@@ -71,8 +72,8 @@ def _install_probe():
             end.synchronize()
             state["seq"] += 1
             _emit(regime, state["layer"], start.elapsed_time(end),
-                  state["tile"], state["seq"])
-            state["tile"] += 1
+                  state["tile"][regime], state["seq"])
+            state["tile"][regime] += 1
             return out
         return wrapped
 
@@ -85,12 +86,18 @@ def _install_probe():
                     self.compiled_indexer.forward, "decode")
                 self._probe_dec = True
             state["layer"] = layer.layer_id
-            state["tile"] = 0
+            state["tile"]["decode"] = 0
         return _orig_decode(self, q, k, v, layer, forward_batch, save_kv_cache)
 
     Backend.forward_decode = forward_decode
 
     _orig_sparse = Backend._forward_extend_sparse
+
+    # Also time the prefill top-k selection (module-level ``select_prefill_fast``,
+    # called by _forward_extend_sparse after scoring). The decode indexer figure
+    # already fuses score + select, so timing prefill scoring alone would
+    # understate it — this keeps the prefill/decode overheads comparable.
+    _F.select_prefill_fast = _wrap_indexer(_F.select_prefill_fast, "prefill_select")
 
     def _forward_extend_sparse(self, q, k, v, layer, forward_batch, cache_loc,
                                logits_soft_cap):
@@ -99,7 +106,8 @@ def _install_probe():
                 self.compiled_indexer_prefill.forward, "prefill")
             self._probe_pre = True
         state["layer"] = layer.layer_id
-        state["tile"] = 0
+        state["tile"]["prefill"] = 0
+        state["tile"]["prefill_select"] = 0
         return _orig_sparse(self, q, k, v, layer, forward_batch, cache_loc,
                             logits_soft_cap)
 

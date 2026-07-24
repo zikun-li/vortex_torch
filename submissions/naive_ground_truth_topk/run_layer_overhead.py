@@ -117,6 +117,11 @@ def report(records, dev_name):
     # ---- Prefill: per query-tile position (each tile does different work) ----
     print(f"\nPREFILL  (single {PROMPT_LEN}-token prompt; indexer fires once "
           f"per query-tile)")
+    # Layer count for the whole-prompt estimate must come from the PREFILL
+    # records: decode may be empty (MAX_NEW_TOKENS=1 or early EOS), which would
+    # otherwise zero out the prefill total.
+    pre_layers = sorted({r["layer"] for r in pre})
+    sel = [r for r in records if r["regime"] == "prefill_select"]
     tiles = sorted({r["tile"] for r in pre})
     per_tile_med = []
     for t in tiles:
@@ -128,11 +133,26 @@ def report(records, dev_name):
         per_tile_med.append(s["median"])
         print(f"  tile {t:>2}: median {s['median']:.4f} ms  "
               f"(min {s['min']:.4f}, max {s['max']:.4f}, n={s['n']} layers)")
+    # Prefill selection (top-k) per tile, so the prefill indexer total includes
+    # the same score+select stages the decode indexer figure already does.
+    sel_tile_med = []
+    for t in sorted({r["tile"] for r in sel}):
+        samples = [r["ms"] for r in sorted(
+            (x for x in sel if x["tile"] == t), key=lambda z: z["seq"])]
+        warm = samples[1:] if len(samples) > 1 else samples
+        sel_tile_med.append(_summ(warm)["median"])
     if per_tile_med:
-        print(f"  per-layer prefill total: {sum(per_tile_med):.4f} ms  "
+        score_total = sum(per_tile_med)
+        select_total = sum(sel_tile_med)
+        combined = score_total + select_total
+        print(f"  per-layer scoring      : {score_total:.4f} ms  "
               f"(sum over {len(tiles)} tiles, medians)")
-        print(f"  whole-prompt prefill   : {sum(per_tile_med) * len(layers):.4f} ms  "
-              f"(x{len(layers)} layers)")
+        print(f"  per-layer selection    : {select_total:.4f} ms  "
+              f"(top-k; sum over tiles, medians)")
+        print(f"  per-layer prefill total: {combined:.4f} ms  "
+              f"(scoring + selection, comparable to the decode indexer figure)")
+        print(f"  whole-prompt prefill   : {combined * len(pre_layers):.4f} ms  "
+              f"(x{len(pre_layers)} layers)")
 
     print("\n(raw JSONL retained at $VORTEX_TIME_OUT)")
 

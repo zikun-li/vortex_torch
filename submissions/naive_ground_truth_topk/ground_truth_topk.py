@@ -13,12 +13,15 @@ from vortex_torch.abs import ContextBase
 @register("naive_ground_truth_topk_sub")
 class NaiveGroundTruthTopK(vFlow):
     r"""
-    Naive ground-truth top-k routing.
+    Naive top-k routing (approximate reference — see the caveat below).
 
-    This flow computes the **true** attention scores from the raw queries
-    and per-token keys (no centroid / envelope approximation), turns them
-    into a global softmax over *all* keys, then selects the ground-truth
-    top-k blocks.
+    This flow computes attention logits from the raw queries and per-token
+    keys (no centroid / envelope approximation), turns them into a per-head
+    softmax over the keys, then selects the top-k blocks. It is **not** an
+    exact ground-truth reference: the softmax denominator excludes the reserved
+    BOS/EOS blocks, which perturbs the middle-block ranking under GQA (see the
+    caveat after the pipeline table). For exact ground truth, use the
+    ``ground_truth_kernel_topk`` submission / ``gt_score_kernels`` path.
 
     Because the router selects at *group-level block* granularity, the
     per-(token, query-head) attention weights are aggregated in two stages:
@@ -41,8 +44,8 @@ class NaiveGroundTruthTopK(vFlow):
     computed directly from the raw keys, so :meth:`forward_cache` is a
     no-op (``cache["k"]`` is populated by the engine regardless).
 
-    Ground-truth pipeline (:meth:`forward_indexer`)
-    ----------------------------------------------
+    Scoring pipeline (:meth:`forward_indexer`)
+    ------------------------------------------
     Let ``scale = 1/sqrt(head_dim)``.
 
     ================  ==========================================  ======================
@@ -62,12 +65,24 @@ class NaiveGroundTruthTopK(vFlow):
     12 select         ``topK(score, o)``                          sparse indices
     ================  ==========================================  ======================
 
-    The two ``dim=0`` reductions (steps 3, 7) are cross-block reductions
-    that exclude the reserved BOS/EOS blocks; those blocks are force-selected
-    by :class:`topK` regardless, so this is harmless. The ``1/sqrt(head_dim)``
-    scale is folded into the numerator ``Exp`` (step 5): subtracting the
-    global max ``M`` first makes the exponential numerically stable for any
-    logit magnitude.
+    **Exactness caveat.** The two ``dim=0`` reductions (steps 3, 7) are
+    cross-block reductions that exclude the reserved BOS/EOS blocks — the
+    framework's ``reduce_dim0`` kernel trims the first ``block_reserved_bos``
+    and last ``block_reserved_eos`` pages. So the softmax denominator ``Z``
+    (step 7) is normalized over the **middle** blocks only, not over all keys.
+    This does not simply cancel: a per-head constant rescale would leave a
+    single head's block ranking unchanged, but the per-head weights are summed
+    across the GQA group (step 10) each carrying a *different* ``Z``, so the
+    middle-block ranking can diverge from a true full-key softmax. Hence this
+    flow is an **approximate** reference. The exact ground truth normalizes the
+    softmax over all keys (BOS/EOS included) and lives in the
+    ``ground_truth_kernel_topk`` submission / ``gt_score_kernels`` path; the
+    standard indexer ops cannot express that (``dim=0`` reductions always trim
+    the reserved pages).
+
+    The ``1/sqrt(head_dim)`` scale is folded into the numerator ``Exp``
+    (step 5): subtracting the global max ``M`` first makes the exponential
+    numerically stable for any logit magnitude.
     """
 
     def __init__(self):
@@ -101,8 +116,11 @@ class NaiveGroundTruthTopK(vFlow):
         cache: Dict[str, torch.Tensor],
         ctx: ContextBase,
     ):
-        r"""Compute ground-truth block scores and select the top-k blocks."""
-        # 1. ground-truth per-token, per-head logits: [S, block_size, H_q]
+        r"""Compute (approximate) block scores and select the top-k blocks.
+
+        Approximate because the softmax denominator excludes reserved BOS/EOS
+        blocks — see the class docstring's exactness caveat."""
+        # 1. per-token, per-head logits: [S, block_size, H_q]
         logits = self.gemm(q, cache["k"], ctx=ctx)
 
         # 2-3. global max per head for numerical stability: [., 1, H_q]
@@ -113,13 +131,15 @@ class NaiveGroundTruthTopK(vFlow):
         shifted = self.sub(logits, m_glob, ctx=ctx)
         e = self.exp_num(shifted, ctx=ctx)
 
-        # 6-8. global softmax denominator per head and its reciprocal: [., 1, H_q]
+        # 6-8. softmax denominator per head and its reciprocal: [., 1, H_q].
+        #      NOTE: sum_glob (dim=0) excludes reserved BOS/EOS blocks, so Z is
+        #      normalized over the middle blocks only (approximate; see caveat).
         z_tok = self.sum_tok(e, ctx=ctx)
         z_glob = self.sum_glob(z_tok, ctx=ctx)
         z_log = self.log_z(z_glob, ctx=ctx)
         z_inv = self.exp_recip(z_log, ctx=ctx)
 
-        # 9. global softmax weights over all keys: [S, block_size, H_q]
+        # 9. per-head softmax weights (middle-normalized): [S, block_size, H_q]
         w = self.mul_norm(e, z_inv, ctx=ctx)
 
         # 10. sum-pool over the GQA group (H_q): [S, block_size, 1]
