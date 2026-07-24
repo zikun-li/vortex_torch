@@ -1,0 +1,22 @@
+{
+  "vortex_module_path":         "submissions/naive_ground_truth_topk/bench_ground_truth_topk.py",
+  "vortex_module_name":         "naive_ground_truth_topk_sub",
+  "vortex_attention_backend":   "flashinfer",
+  "vortex_block_size":          16,
+  "vortex_workload_chunk_size": 32,
+  "vortex_topk_val":            64,
+  "vortex_topk_ratio":          0.0625,
+  "vortex_block_reserved_bos":  1,
+  "vortex_block_reserved_eos":  2,
+  "vortex_layers_skip":         [],
+  "vortex_dtype":               "bfloat16",
+  "kv_cache_dtype":             "auto",
+  "vortex_sparse_prefill":      true,
+  "chunked_prefill_size":       -1,
+  "disable_radix_cache":        true,
+  "disable_cuda_graph":         true,
+  "context_length":             8192,
+  "vortex_max_seq_lens":        8192,
+  "max_prefill_tokens":         8192,
+  "mem_fraction_static":        0.8
+}
