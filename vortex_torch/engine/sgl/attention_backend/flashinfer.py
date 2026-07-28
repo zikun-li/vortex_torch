@@ -1095,6 +1095,7 @@ class VortexFlashInferBackend(AttentionBackend):
                 topk_val=self.ctx_prefill.topk_val,
                 reserved_bos=self.ctx_prefill.block_reserved_bos,
                 reserved_eos=self.ctx_prefill.block_reserved_eos,
+                deterministic=self.ctx_prefill.deterministic_topk,
             )
 
         block_mask = torch.empty(

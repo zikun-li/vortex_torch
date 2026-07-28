@@ -47,6 +47,7 @@ class Context(ContextBase):
         "tensor_id_to_tensor_name_map",
         "compilation_header_lines", "auxilary_func_def_lines",
         "compilation_cache_dir",
+        "deterministic_topk",
     )
 
     # --- page & block ---
@@ -82,6 +83,7 @@ class Context(ContextBase):
     compilation_header_lines: list     #: Lines inserted at the top of the generated module.
     auxilary_func_def_lines: list      #: Auxiliary function/kernel definitions to embed.
     compilation_cache_dir: str         #: Where to write the generated module.
+    deterministic_topk: bool           #: Propagate deterministic=True to top_k_ragged_transform.
 
 
     def __init__(self) -> None:
@@ -136,6 +138,7 @@ class Context(ContextBase):
         self.compilation_header_lines = []
         self.auxilary_func_def_lines = []
         self.compilation_cache_dir = getattr(sa, "vortex_compilation_cache_dir", None)
+        self.deterministic_topk = bool(getattr(sa, "vortex_deterministic_topk", False))
         self.sparse_attention_name = (
             parent.__class__.__name__.lower() + f"_cache_{uuid.uuid4().hex[:8]}"
         )

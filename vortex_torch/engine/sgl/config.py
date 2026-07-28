@@ -98,6 +98,10 @@ class VortexConfig:
     # Opt-in GQA sparse-prefill path (flashinfer VariableBlockSparseAttention).
     # Default off preserves the historical dense-prefill behaviour exactly.
     sparse_prefill: bool = False
+    # Deterministic GT top-k: propagate deterministic=True to flashinfer's
+    # top_k_ragged_transform for single-request bit-exact block selection (pair with
+    # FLASHINFER_TOPK_ALGO=filtered). Default off preserves prior behaviour.
+    deterministic_topk: bool = False
     # Analysis-only target-row capture/patch support. None has zero runtime cost.
     prefill_patch: Optional[PrefillPatchConfig] = None
 

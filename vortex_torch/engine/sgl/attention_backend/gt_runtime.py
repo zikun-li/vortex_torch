@@ -72,6 +72,7 @@ def gt_prefill_select(
     topk_val: int,
     reserved_bos: int,
     reserved_eos: int,
+    deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select a head-major GT CSR from ``[T,H_kv,S]`` scores."""
     import flashinfer.topk as fitk
@@ -98,7 +99,7 @@ def gt_prefill_select(
         inp = torch.cat([inp, pad], dim=1)
     lengths = n_mid.clamp(min=1).to(torch.int32)
     offsets = torch.full((R,), bos, dtype=torch.int32, device=dev)
-    out_mid = fitk.top_k_ragged_transform(inp.contiguous(), offsets, lengths, k_blocks)
+    out_mid = fitk.top_k_ragged_transform(inp.contiguous(), offsets, lengths, k_blocks, deterministic=deterministic)
 
     block_ids, kv_indptr, _ = assemble_block_ids(
         out_mid, n_blocks, k_take, bos=bos, eos=eos, k_blocks=k_blocks,
@@ -157,6 +158,7 @@ def gt_topk_prefill(score_in, o, ctx) -> None:
         topk_val=ctx.topk_val,
         reserved_bos=ctx.block_reserved_bos,
         reserved_eos=ctx.block_reserved_eos,
+        deterministic=ctx.deterministic_topk,
     )
     st["kv_indptr"] = kv_indptr
     st["block_ids"] = block_ids

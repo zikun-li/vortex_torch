@@ -5,9 +5,12 @@ from ...utils import Schedule, INDENT, indent_block
 from ...abs import FORMAT
 from .impl import AVAILABLE_IMPL_BACKENDS
 import os
+import tempfile
 def generate_interface(full_graph: Graph, sub_graphs: list[Graph], ctx: Context) -> str:
 
-    cache_dir = ctx.compilation_cache_dir or os.path.dirname(__file__)
+    # Never fall back to the package source dir (os.path.dirname(__file__)) -- on a
+    # shared/remote install it accretes generated compiled modules. Use /tmp.
+    cache_dir = ctx.compilation_cache_dir or os.path.join(tempfile.gettempdir(), f"vortex-codegen-{os.getpid()}")
     cache_dir = os.path.expanduser(cache_dir)
     cache_dir = os.path.abspath(cache_dir)
     
