@@ -34,7 +34,12 @@ dependencies = [
 gt = ["gt_score_kernels"]
 
 [tool.setuptools.packages.find]
-include = ["vortex_torch*"]
+# Ship the GT submission in the wheel (site-packages/submissions/...) so runtime needs no source
+# checkout; existing VortexConfig.module_path="submissions/..." resolves for both checkout and wheel.
+include = ["vortex_torch*", "submissions*"]
+
+[tool.setuptools.package-data]
+"submissions.ground_truth_kernel_topk" = ["*.json"]
 
 [tool.pytest.ini_options]
 markers = [
