@@ -1,0 +1,11 @@
+# Ship ALL of vortex_torch's + the GT submission's data files in the wheel (dispatch-bucket meta.json,
+# kernel sources, etc.) so the installed package needs no source checkout. Without the meta.json files
+# the runtime top-k dispatch (custom_ops/**/dispatch.py -> _dispatch_match._load_leaves) FileNotFounds.
+# Exclude regenerable/local junk: bytecode, the codegen cache, and any locally-built kernels (JIT at runtime).
+graft vortex_torch
+graft submissions
+global-exclude *.pyc
+global-exclude *_compiled_func.py
+global-exclude *.so
+global-exclude *.o
+global-exclude *.egg-info

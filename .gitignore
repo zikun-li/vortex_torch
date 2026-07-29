@@ -328,3 +328,5 @@ algorithm_scientist/research/traces
 /new_results/
 # Benchmark/summary output archive (moved summary* dirs live here)
 /result/
+*_compiled_func.py
+__pycache__/

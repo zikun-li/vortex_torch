@@ -44,13 +44,16 @@ eval = [
     "unitxt",
 ]
 
+[tool.setuptools]
+# Ship non-.py data files (dispatch-bucket meta.json, kernel sources, ...) via MANIFEST.in graft.
+# Without this the wheel omits e.g. custom_ops/topk_output/flashinfer/*/meta.json and the decode
+# top-k dispatch (_dispatch_match._load_leaves) raises FileNotFoundError at runtime.
+include-package-data = true
+
 [tool.setuptools.packages.find]
 # Ship the GT submission in the wheel (site-packages/submissions/...) so runtime needs no source
 # checkout; existing VortexConfig.module_path="submissions/..." resolves for both checkout and wheel.
 include = ["vortex_torch*", "submissions*"]
-
-[tool.setuptools.package-data]
-"submissions.ground_truth_kernel_topk" = ["*.json"]
 
 [tool.pytest.ini_options]
 markers = [
