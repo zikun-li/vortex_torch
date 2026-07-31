@@ -4,10 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vortex_torch"
-version = "0.5.0"
+version = "0.6.0"
 requires-python = ">=3.12"
+# Runtime deps for vortex_torch as a LIBRARY. The sab `vortex` sparse-attn backend uses only
+# vortex_torch.engine.sgl + gt_score_kernels; flashinfer/sglang/triton/transformers come from the
+# host env. Vortex's OWN eval-harness closure (transformers pin, lighteval, inspect-ai, unitxt, ...)
+# is moved to the [eval] extra so it no longer forces transformers==4.57.1 -- which conflicts with
+# sglang 0.5.13 (requires transformers==5.8.1). This matches how MAST already runs vortex: on
+# PYTHONPATH against the env's deps, never pip-installing this closure.
 dependencies = [
     "torch>=2.7",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+# Ground-truth submission (submissions/ground_truth_kernel_topk) needs the fused
+# kernels in the sibling gt_score_kernels repo. Not on PyPI / GitHub is
+# tunnel-only on this host, so install it EDITABLE from the local checkout:
+#   pip install -e /data/users/zikunli/gt_score_kernels
+# (install_vortex.sh does this). The GT ops import it lazily, so this is only
+# needed when running that submission.
+gt = ["gt_score_kernels"]
+# Vortex's standalone eval/benchmark harness deps -- NOT needed for the sab `vortex` backend. Kept
+# out of the runtime deps so they don't pin transformers==4.57.1 (conflicts with sglang 0.5.13).
+# Install with `pip install vortex_torch[eval]` when running Vortex's own harness.
+eval = [
     "lighteval[math]==0.12.2",
     "huggingface_hub==0.36.2",
     "inspect-ai==0.3.207",
@@ -23,14 +44,18 @@ dependencies = [
     "unitxt",
 ]
 
-[project.optional-dependencies]
-# Ground-truth submission (submissions/ground_truth_kernel_topk) needs the fused
-# kernels in the sibling gt_score_kernels repo. Not on PyPI / GitHub is
-# tunnel-only on this host, so install it EDITABLE from the local checkout:
-#   pip install -e /data/users/zikunli/gt_score_kernels
-# (install_vortex.sh does this). The GT ops import it lazily, so this is only
-# needed when running that submission.
-gt = ["gt_score_kernels"]
+[tool.setuptools]
+# Ship non-.py data files (dispatch-bucket meta.json, kernel sources, ...) via MANIFEST.in graft.
+# Without this the wheel omits e.g. custom_ops/topk_output/flashinfer/*/meta.json and the decode
+# top-k dispatch (_dispatch_match._load_leaves) raises FileNotFoundError at runtime.
+include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["vortex_torch*"]
+# Ship the GT submission in the wheel (site-packages/submissions/...) so runtime needs no source
+# checkout; existing VortexConfig.module_path="submissions/..." resolves for both checkout and wheel.
+include = ["vortex_torch*", "submissions*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: opt-in real-model GPU integration test",
+]

@@ -62,6 +62,7 @@ class Context(ContextBase):
         "query_arg_names",
         "compilation_header_lines", "auxilary_func_def_lines",
         "compilation_cache_dir",
+        "deterministic_topk",
         # ---- tensor-core (bf16-compute) codegen toggle ----
         # When True, the triton W-kernel keeps compute blocks in bf16
         # (loads cast to bf16, accumulations promote to fp32) and emits
@@ -130,6 +131,7 @@ class Context(ContextBase):
     compilation_header_lines: list
     auxilary_func_def_lines: list
     compilation_cache_dir: str
+    deterministic_topk: bool
     use_tensor_core: bool
 
     def __init__(self) -> None:
@@ -304,6 +306,7 @@ class Context(ContextBase):
         self.compilation_header_lines = []
         self.auxilary_func_def_lines = []
         self.compilation_cache_dir = sa.vortex_compilation_cache_dir
+        self.deterministic_topk = bool(getattr(sa, "vortex_deterministic_topk", False))
         self.sparse_attention_name = parent.sparse_attention.__class__.__name__.lower() + f"_{uuid.uuid4().hex[:8]}"  # unique name for this attention instance
         self.impl_backend = getattr(sa, "vortex_impl_backend", "triton") or "triton"
         self.vortex_attention_backend = getattr(

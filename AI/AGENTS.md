@@ -37,6 +37,10 @@ materials, not work product.
 
 ### Environment — activate the `vortex_v1` conda env first
 
+This is the legacy vendored-SGLang 0.5.9 environment for Vortex's standalone
+submission harness. SAB RULER/AIME campaigns use their patched SGLang 0.5.13
+serving environment instead.
+
 Every python invocation in this contract (`check_engine_config`,
 `run_submission_aime24.py`, the pre-flight loops in §5/§5c/§5f,
 the iterate driver, etc.) expects the **`vortex_v1`** conda

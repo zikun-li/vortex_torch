@@ -30,6 +30,7 @@ from vortex_torch.engine.sgl.attention_backend.prefill_select import (
     select_prefill_fast,
 )
 from vortex_torch.engine.sgl.attention_backend._gtprof import gtprof
+from vortex_torch.engine.sgl.prefill_patch import PrefillPatchRuntime
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
 
@@ -295,6 +296,22 @@ class VortexFlashInferBackend(AttentionBackend):
         self.sparse_attention = model_runner.sparse_attention
         self.ctx = Context()
         self._compile(model_runner)
+        self.prefill_patch = PrefillPatchRuntime(
+            model_runner, block_size=self.block_size, layers_skip=self.layers_skip
+        )
+        if self.prefill_patch.enabled:
+            mode = self.prefill_patch.config.mode
+            if not self.gt_decode:
+                raise ValueError("prefill patch analysis currently supports GT top-k only")
+            if mode == "capture_dense":
+                if self.sparse_prefill:
+                    raise ValueError(
+                        "capture_dense requires vortex_sparse_prefill=False"
+                    )
+            elif not self.gt_prefill:
+                raise ValueError(
+                    f"{mode} requires vortex_sparse_prefill=True with GT top-k"
+                )
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata: Dict[int, List[BatchDecodeWithPagedKVCacheWrapper]] = {}
@@ -714,6 +731,22 @@ class VortexFlashInferBackend(AttentionBackend):
 
         q = q.contiguous()
 
+        if self.prefill_patch.enabled:
+            if not self.forward_metadata.extend_no_prefix or not save_kv_cache:
+                raise ValueError(
+                    "prefill patch analysis only supports a fresh, cache-saving prefill"
+                )
+            self.prefill_patch.set_input(
+                forward_batch.input_ids, batch_size=forward_batch.batch_size
+            )
+            if self.prefill_patch.config.mode == "capture_dense":
+                self.prefill_patch.capture_dense(
+                    layer.layer_id,
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                )
+
         # GQA sparse-prefill path: fresh prompt only, non-skip layers, and only
         # when save_kv_cache is set. The sparse path MUST write K/V + summaries to
         # the pool before the indexer runs (it reads them back), so it cannot honor
@@ -893,6 +926,19 @@ class VortexFlashInferBackend(AttentionBackend):
                     )
                     kv_indptr = self.ctx_prefill.gt_state["kv_indptr"]
                     block_ids = self.ctx_prefill.gt_state["block_ids"]
+                    scores = self.ctx_prefill.gt_state["scores"]
+                    if b == S_r:
+                        self.prefill_patch.capture_sparse(
+                            layer.layer_id,
+                            kv_indptr=kv_indptr,
+                            block_ids=block_ids,
+                            scores=scores,
+                            tile_len=tlen,
+                            tile_offset=a,
+                            seq_len=S_r,
+                            block_size=C,
+                            num_kv_heads=self.num_kv_heads,
+                        )
                     _gt_dump("prefill", f"L{layer.layer_id}_s{s0}_a{a}",
                              layer_id=layer.layer_id, q_offset=a, tlen=tlen, s0=s0,
                              num_kv_heads=self.num_kv_heads, group_size=self.group_size,
@@ -902,13 +948,27 @@ class VortexFlashInferBackend(AttentionBackend):
                              kv_indptr=kv_indptr, block_ids=block_ids)
                     # run() ignores block_mask (diagonal-split); pass a placeholder.
                     block_mask = torch.empty((0, 1, C), dtype=torch.bool, device=device)
-                    o[s0 + a : s0 + b] = self.prefill_sparse_wrapper.run(
+                    tile_o = self.prefill_sparse_wrapper.run(
                         q_tile.contiguous(),
                         k_req[:b].contiguous(),
                         v_req[:b].contiguous(),
                         kv_indptr, block_ids, block_mask, self.block_size,
                         sm_scale=layer.scaling, logits_soft_cap=logits_soft_cap,
                     )
+                    if (
+                        b == S_r
+                        and self.prefill_patch.enabled
+                        and self.prefill_patch.config.mode == "apply"
+                        and self.prefill_patch.wants_layer(layer.layer_id)
+                    ):
+                        tile_o[-1] = self._apply_gt_prefill_patch(
+                            q_req=q3[s0:s1],
+                            k_req=k_req,
+                            v_req=v_req,
+                            layer=layer,
+                            logits_soft_cap=logits_soft_cap,
+                        )
+                    o[s0 + a : s0 + b] = tile_o
                     continue
 
                 # Hard guard BEFORE plan_decode: plan_decode launches a CUDA kernel
@@ -970,6 +1030,97 @@ class VortexFlashInferBackend(AttentionBackend):
                     sm_scale=layer.scaling, logits_soft_cap=logits_soft_cap,
                 )
         return o.view(-1, Hq * Dh)
+
+    def _apply_gt_prefill_patch(
+        self,
+        *,
+        q_req: torch.Tensor,
+        k_req: torch.Tensor,
+        v_req: torch.Tensor,
+        layer: RadixAttention,
+        logits_soft_cap,
+    ) -> torch.Tensor:
+        """Recompute the final aligned query block and return its last row."""
+        from vortex_torch.engine.sgl.attention_backend.gt_runtime import (
+            gt_prefill_scores,
+            gt_prefill_select,
+        )
+
+        config = self.prefill_patch.config
+        dense, sparse = self.prefill_patch.load_apply_layer(
+            layer.layer_id, device=q_req.device
+        )
+        seq_len = q_req.shape[0]
+        tail_start = int(sparse["tail_start"].item())
+        tail_len = int(sparse["tail_len"].item())
+        expected_tail_start = ((seq_len - 1) // self.block_size) * self.block_size
+        if tail_start != expected_tail_start or tail_len != seq_len - tail_start:
+            raise ValueError("sparse trace final-block geometry does not match request")
+
+        q_tail = q_req[tail_start:].contiguous().clone()
+        if config.components in {"q", "qkv"}:
+            if dense["q_target"].shape != q_tail[-1].shape:
+                raise ValueError("dense target Q shape does not match sparse request")
+            q_tail[-1].copy_(dense["q_target"])
+
+        if config.components in {"kv", "qkv"}:
+            k_attn = dense["k_prefix"]
+            v_attn = dense["v_prefix"]
+            if k_attn.shape != k_req.shape or v_attn.shape != v_req.shape:
+                raise ValueError("dense K/V prefix shape does not match sparse request")
+        else:
+            k_attn = k_req
+            v_attn = v_req
+        k_attn = k_attn.contiguous()
+        v_attn = v_attn.contiguous()
+
+        q4 = q_tail.reshape(
+            tail_len, self.num_kv_heads, self.group_size, self.head_dim
+        )
+        scores = gt_prefill_scores(
+            q4,
+            k_attn,
+            block_size=self.block_size,
+            q_offset=tail_start,
+            scale=layer.scaling,
+        )
+        if config.routing == "frozen":
+            kv_indptr = sparse["kv_indptr"].to(torch.int32).contiguous()
+            block_ids = sparse["block_ids"].to(torch.int32).contiguous()
+        else:
+            block_ids, kv_indptr = gt_prefill_select(
+                scores,
+                block_size=self.block_size,
+                q_offset=tail_start,
+                topk_val=self.ctx_prefill.topk_val,
+                reserved_bos=self.ctx_prefill.block_reserved_bos,
+                reserved_eos=self.ctx_prefill.block_reserved_eos,
+                deterministic=self.ctx_prefill.deterministic_topk,
+            )
+
+        block_mask = torch.empty(
+            (0, 1, self.block_size), dtype=torch.bool, device=q_req.device
+        )
+        patched = self.prefill_sparse_wrapper.run(
+            q_tail,
+            k_attn,
+            v_attn,
+            kv_indptr,
+            block_ids,
+            block_mask,
+            self.block_size,
+            sm_scale=layer.scaling,
+            logits_soft_cap=logits_soft_cap,
+        )
+        self.prefill_patch.record_applied(
+            layer.layer_id,
+            kv_indptr=kv_indptr,
+            block_ids=block_ids,
+            scores_target=scores[-1],
+            tail_start=tail_start,
+            tail_len=tail_len,
+        )
+        return patched[-1]
 
     def forward_decode(
         self,

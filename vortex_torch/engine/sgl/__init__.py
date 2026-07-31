@@ -14,10 +14,18 @@ __all__ = [
     "check_engine_config",
     "get_engine",
     "get_engine_from_json",
+    "PrefillPatchConfig",
+    "PrefillPatchTrace",
 ]
 
 
 def __getattr__(name):
+    if name == "PrefillPatchConfig":
+        from vortex_torch.engine.sgl.config import PrefillPatchConfig
+        return PrefillPatchConfig
+    if name == "PrefillPatchTrace":
+        from vortex_torch.engine.sgl.prefill_patch import PrefillPatchTrace
+        return PrefillPatchTrace
     if name in __all__:
         from vortex_torch.engine.sgl import api
         return getattr(api, name)

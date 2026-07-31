@@ -67,6 +67,14 @@ MANIFEST
 !vortex_torch/custom_ops/**/config.json
 
 tests/
+!tests/
+tests/*
+!tests/test_gt_runtime_compat.py
+!tests/prefill_sparse/
+tests/prefill_sparse/*
+!tests/prefill_sparse/test_prefill_patch.py
+!tests/prefill_sparse/test_prefill_patch_engine.py
+!tests/prefill_sparse/test_logprob_prefill_decode.py
 *_backup.py
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -321,3 +329,5 @@ algorithm_scientist/research/traces
 /new_results/
 # Benchmark/summary output archive (moved summary* dirs live here)
 /result/
+*_compiled_func.py
+__pycache__/

@@ -18,12 +18,15 @@ from ...utils import INDENT, indent_block
 from ...abs import FORMAT
 from .impl import AVAILABLE_IMPL_BACKENDS
 import os
+import tempfile
 
 
 def generate_interface(full_graph: Graph, sub_graphs: List[Graph], ctx: Context) -> Tuple[str, str]:
     """Emit the compiled module to disk and return ``(file_path, class_name)``."""
 
-    cache_dir = ctx.compilation_cache_dir or os.path.dirname(__file__)
+    # Never fall back to the package source dir (os.path.dirname(__file__)) -- on a
+    # shared/remote install it accretes generated *_compiled_func.py files. Use /tmp.
+    cache_dir = ctx.compilation_cache_dir or os.path.join(tempfile.gettempdir(), f"vortex-codegen-{os.getpid()}")
     cache_dir = os.path.expanduser(cache_dir)
     cache_dir = os.path.abspath(cache_dir)
 

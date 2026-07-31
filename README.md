@@ -53,6 +53,12 @@ This makes Vortex a platform for **autonomous algorithm discovery**: AI agents g
 
 ## 🚀 Installation
 
+The SAB RULER/AIME campaign runtime uses **SGLang 0.5.13** with Vortex's
+integration hooks applied by `sparse-attn-bench/scripts/mast/patch_sglang_vortex.py`;
+its reproducible local recipe is `sparse-attn-bench/scripts/setup_vortex_env.sh`.
+The commands below install the legacy vendored-SGLang 0.5.9 environment retained
+for Vortex's standalone submission harness.
+
 ```bash
 git clone --recursive https://github.com/Infini-AI-Lab/vortex_torch.git
 
@@ -63,7 +69,7 @@ cd ../../../../
 
 # Install Vortex
 cd vortex_torch
-pip install -e .
+pip install -e ".[eval]"
 ```
 
 ---
@@ -509,5 +515,3 @@ If you find Vortex useful in your research, please cite:
       url={https://arxiv.org/abs/2606.06453}, 
 }
 ```
-
-
