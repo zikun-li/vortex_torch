@@ -63,7 +63,7 @@ pip install -e "$SGLANG_DIR"
 
 # ---- 4. vortex_torch (editable) -------------------------------------------
 echo ">>> [4/4] installing vortex_torch (editable) from $REPO_ROOT"
-pip install -e "$REPO_ROOT"
+pip install -e "${REPO_ROOT}[eval]"
 
 # ---- 4b. gt_score_kernels (editable, optional) ----------------------------
 # Only the ground-truth submission (submissions/ground_truth_kernel_topk) needs

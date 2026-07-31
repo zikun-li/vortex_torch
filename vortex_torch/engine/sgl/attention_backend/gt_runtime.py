@@ -23,6 +23,7 @@ top-k selector.
 
 from __future__ import annotations
 
+import inspect
 import math
 
 import torch
@@ -100,12 +101,37 @@ def gt_prefill_select(
     lengths = n_mid.clamp(min=1).to(torch.int32)
     offsets = torch.full((R,), bos, dtype=torch.int32, device=dev)
     # FlashInfer 0.6.3 (the legacy vendored-sglang environment) predates this
-    # keyword. Omitting a false value preserves its default behavior while the
-    # 0.5.13 campaign stack receives the flag when determinism is requested.
-    topk_kwargs = {"deterministic": True} if deterministic else {}
-    out_mid = fitk.top_k_ragged_transform(
-        inp.contiguous(), offsets, lengths, k_blocks, **topk_kwargs
-    )
+    # keyword. Omitting a false value preserves its default behavior. When the
+    # feature is requested, fail before launch with a useful compatibility error.
+    topk_fn = fitk.top_k_ragged_transform
+    topk_kwargs = {}
+    if deterministic:
+        try:
+            parameters = inspect.signature(topk_fn).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        supports_kwarg = any(
+            parameter.name == "deterministic"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if parameters and not supports_kwarg:
+            raise RuntimeError(
+                "vortex_deterministic_topk=True requires a FlashInfer "
+                "top_k_ragged_transform implementation with the deterministic keyword "
+                "(the SGLang 0.5.13 campaign stack uses FlashInfer 0.6.12); "
+                "upgrade FlashInfer or disable deterministic_topk"
+            )
+        topk_kwargs["deterministic"] = True
+    try:
+        out_mid = topk_fn(inp.contiguous(), offsets, lengths, k_blocks, **topk_kwargs)
+    except TypeError as exc:
+        if deterministic and "deterministic" in str(exc):
+            raise RuntimeError(
+                "vortex_deterministic_topk=True is unsupported by this FlashInfer version; "
+                "upgrade to the SGLang 0.5.13 campaign stack or disable deterministic_topk"
+            ) from exc
+        raise
 
     block_ids, kv_indptr, _ = assemble_block_ids(
         out_mid, n_blocks, k_take, bos=bos, eos=eos, k_blocks=k_blocks,

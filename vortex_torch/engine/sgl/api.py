@@ -2,7 +2,7 @@ import json
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Union
 
 import sglang as sgl
 
@@ -24,6 +24,24 @@ return max(static_kv_budget, dynamic_kv_budget);
 MODEL_PATH = "Qwen/Qwen3-1.7B"
 
 
+def _resolve_runtime_module_path(raw: str) -> str:
+    """Resolve a runtime flow path from the CWD or the installed distribution."""
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    cwd_candidate = Path.cwd() / path
+    if cwd_candidate.is_file():
+        return str(cwd_candidate.resolve())
+
+    # ``submissions`` is installed next to ``vortex_torch`` in both editable and
+    # wheel installs. This keeps the packaged defaults independent of caller CWD.
+    package_candidate = Path(__file__).resolve().parents[3] / path
+    if package_candidate.is_file():
+        return str(package_candidate.resolve())
+    return raw
+
+
 def get_engine(
     *,
     model_path: str = MODEL_PATH,
@@ -42,6 +60,7 @@ def get_engine(
     vortex_impl_backend: str = "triton",
     vortex_use_tensor_core: bool = False,
     vortex_sparse_prefill: bool = False,
+    vortex_deterministic_topk: bool = False,
     vortex_prefill_patch: PrefillPatchConfig | dict | None = None,
     kv_cache_dtype: str = "auto",
     **kwargs,
@@ -60,11 +79,12 @@ def get_engine(
         vortex_workload_chunk_size=vortex_workload_chunk_size,
         vortex_layers_skip=layers_skip,
         vortex_module_name=vortex_module_name,
-        vortex_module_path=vortex_module_path,
+        vortex_module_path=_resolve_runtime_module_path(vortex_module_path),
         vortex_schedule_policy=policy,
         vortex_impl_backend=vortex_impl_backend,
         vortex_use_tensor_core=vortex_use_tensor_core,
         vortex_sparse_prefill=vortex_sparse_prefill,
+        vortex_deterministic_topk=vortex_deterministic_topk,
         vortex_prefill_patch=vortex_prefill_patch,
         vortex_dtype="bfloat16",
         vortex_compilation_cache_dir="~/.vortex_compilation_cache",

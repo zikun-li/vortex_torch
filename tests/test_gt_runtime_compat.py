@@ -3,6 +3,7 @@ import tomllib
 from pathlib import Path
 
 import flashinfer.topk
+import pytest
 import torch
 
 from gt_score_kernels.group_score_topk import assemble
@@ -52,6 +53,21 @@ def test_prefill_select_omits_unsupported_false_deterministic_kwarg(monkeypatch)
     assert called
 
 
+def test_prefill_select_rejects_unsupported_enabled_determinism(monkeypatch):
+    _patch_assemble(monkeypatch)
+
+    def legacy_topk(input, offsets, lengths, k):
+        del input, offsets, lengths
+        return torch.zeros((1, k), dtype=torch.int32)
+
+    monkeypatch.setattr(flashinfer.topk, "top_k_ragged_transform", legacy_topk)
+    with pytest.raises(RuntimeError, match="requires a FlashInfer"):
+        _gt_prefill_select(
+            _scores(), block_size=1, q_offset=3, topk_val=1,
+            reserved_bos=1, reserved_eos=1, deterministic=True,
+        )
+
+
 def test_prefill_select_forwards_enabled_deterministic_kwarg(monkeypatch):
     _patch_assemble(monkeypatch)
     seen = None
@@ -68,3 +84,13 @@ def test_prefill_select_forwards_enabled_deterministic_kwarg(monkeypatch):
         reserved_bos=1, reserved_eos=1, deterministic=True,
     )
     assert seen is True
+
+
+def test_runtime_module_path_falls_back_to_packaged_submission(monkeypatch, tmp_path):
+    from vortex_torch.engine.sgl.api import _resolve_runtime_module_path
+
+    monkeypatch.chdir(tmp_path)
+    resolved = Path(_resolve_runtime_module_path("submissions/example_block_sparse_attention.py"))
+    assert resolved.is_absolute()
+    assert resolved.is_file()
+    assert resolved.name == "example_block_sparse_attention.py"

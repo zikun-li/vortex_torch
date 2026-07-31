@@ -69,7 +69,7 @@ cd ../../../../
 
 # Install Vortex
 cd vortex_torch
-pip install -e .
+pip install -e ".[eval]"
 ```
 
 ---
@@ -515,4 +515,3 @@ If you find Vortex useful in your research, please cite:
       url={https://arxiv.org/abs/2606.06453}, 
 }
 ```
-

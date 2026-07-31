@@ -26,7 +26,7 @@ pip install -e "python"
 cd ../../../../
 
 # 2. Vortex (editable)
-pip install -e .
+pip install -e ".[eval]"
 ```
 
 If you cloned without `--recursive`, pull the submodules first:
