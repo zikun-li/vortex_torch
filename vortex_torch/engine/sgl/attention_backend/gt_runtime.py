@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Runtime glue for the ground-truth indexer ops (``GTGroupScore`` / ``GTTopK``).
 
 These are the plain-Python callables that the ``Schedule.S`` custom_impl codegen
@@ -22,6 +20,8 @@ Data flow (decode): the compiled indexer runs ``gt_group_score_decode`` (exact
 group-level block scores over the paged cache) followed by the built-in exact
 top-k selector.
 """
+
+from __future__ import annotations
 
 import math
 
@@ -99,7 +99,13 @@ def gt_prefill_select(
         inp = torch.cat([inp, pad], dim=1)
     lengths = n_mid.clamp(min=1).to(torch.int32)
     offsets = torch.full((R,), bos, dtype=torch.int32, device=dev)
-    out_mid = fitk.top_k_ragged_transform(inp.contiguous(), offsets, lengths, k_blocks, deterministic=deterministic)
+    # FlashInfer 0.6.3 (the legacy vendored-sglang environment) predates this
+    # keyword. Omitting a false value preserves its default behavior while the
+    # 0.5.13 campaign stack receives the flag when determinism is requested.
+    topk_kwargs = {"deterministic": True} if deterministic else {}
+    out_mid = fitk.top_k_ragged_transform(
+        inp.contiguous(), offsets, lengths, k_blocks, **topk_kwargs
+    )
 
     block_ids, kv_indptr, _ = assemble_block_ids(
         out_mid, n_blocks, k_take, bos=bos, eos=eos, k_blocks=k_blocks,

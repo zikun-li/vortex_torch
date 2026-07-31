@@ -69,6 +69,7 @@ MANIFEST
 tests/
 !tests/
 tests/*
+!tests/test_gt_runtime_compat.py
 !tests/prefill_sparse/
 tests/prefill_sparse/*
 !tests/prefill_sparse/test_prefill_patch.py

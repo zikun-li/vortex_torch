@@ -100,6 +100,10 @@ modifying the compiler itself, not when writing a submission.
 
 ## Environment — activate the `vortex_v1` conda env first
 
+This is the legacy vendored-SGLang 0.5.9 environment for Vortex's standalone
+submission harness. SAB RULER/AIME campaigns use the patched SGLang 0.5.13
+environment documented in `sparse-attn-bench/scripts/setup_vortex_env.sh`.
+
 Every python invocation in this project (`check_engine_config`,
 `run_submission_aime24.py`, the pre-flight loops in the slash
 commands, etc.) expects the **`vortex_v1`** conda environment.

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
-# Reproducible build of the `vortex_v1` conda environment — the default env for
-# this project (all the slash commands, RULER, and AIME24 runners expect it).
+# Reproducible build of the legacy `vortex_v1` standalone environment. Vortex's
+# submission slash commands and AIME24 harness still use it; SAB RULER/AIME
+# campaigns use patched sglang 0.5.13 instead (see sparse-attn-bench's
+# scripts/setup_vortex_env.sh and scripts/mast/patch_sglang_vortex.py).
 #
 # Unlike `vortex_glm` (see install_vortex_glm.sh), this env KEEPS the pinned
 # transformers==4.57.1 that both sglang and vortex_torch require — there is NO

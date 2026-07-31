@@ -1,5 +1,14 @@
 # Installation
 
+## SAB campaign runtime (SGLang 0.5.13)
+
+RULER/AIME campaigns run Vortex against stock SGLang 0.5.13 with the integration
+hooks from `sparse-attn-bench/scripts/mast/patch_sglang_vortex.py`. Use
+`sparse-attn-bench/scripts/setup_vortex_env.sh` for the local environment; MAST
+applies the same patch to its 0.5.13 overlay.
+
+## Legacy standalone runtime (SGLang 0.5.9)
+
 Vortex plugs into a **vendored SGLang** (under `third_party/`). Install SGLang
 in editable mode first, then Vortex. Installation is CPU-only — all kernels are
 prebuilt wheels or JIT-compiled at runtime — so it works even while the GPUs are
@@ -26,9 +35,9 @@ If you cloned without `--recursive`, pull the submodules first:
 git submodule update --init --recursive
 ```
 
-## Reproducible conda environment (recommended)
+## Reproducible legacy conda environment
 
-The repo ships a one-shot script that builds the exact tested environment —
+The repo ships a one-shot script for the standalone submission harness —
 Python 3.12, torch 2.9.1+cu128, flashinfer 0.6.3, transformers 4.57.1, plus
 editable SGLang and Vortex:
 
