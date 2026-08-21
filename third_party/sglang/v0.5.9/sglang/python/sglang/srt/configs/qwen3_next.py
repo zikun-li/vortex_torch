@@ -250,9 +250,24 @@ class Qwen3NextConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.mlp_only_layers = mlp_only_layers
+        # Qwen3.5 text-only exports describe the interleaving explicitly
+        # instead of carrying ``full_attention_interval``.  Preserve that
+        # list so the shared Qwen3-Next model implementation can derive the
+        # linear/full layer dispatch without requiring the interval field.
+        self.layer_types = layer_types
 
     @property
     def layers_block_type(self):
+        if self.layer_types is not None:
+            return [
+                (
+                    HybridLayerType.full_attention.value
+                    if type_value in ("attention", "full_attention")
+                    else HybridLayerType.linear_attention.value
+                )
+                for type_value in self.layer_types
+            ]
+
         layer_type_list = []
 
         for l in range(self.num_hidden_layers):

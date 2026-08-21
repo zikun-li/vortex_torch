@@ -1622,6 +1622,8 @@ class ServerArgs:
                     )
         elif model_arch in [
             "Qwen3NextForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
         ]:
