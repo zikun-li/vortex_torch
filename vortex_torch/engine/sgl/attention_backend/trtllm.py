@@ -112,6 +112,10 @@ class VortexTRTLLMBackend(AttentionBackend):
         
         # Assign key configuration and parameters
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # SGLang's hybrid-linear dispatcher aliases these public pool handles
+        # from its full-attention backend.
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.page_size = model_runner.server_args.page_size
         self.block_size = model_runner.server_args.vortex_block_size
         self.layers_skip = model_runner.server_args.vortex_layers_skip

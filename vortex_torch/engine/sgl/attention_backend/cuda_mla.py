@@ -137,6 +137,10 @@ class VortexCudaMLABackend(AttentionBackend):
         )
         self.layers_skip = sa.vortex_layers_skip
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Keep the standard SGLang attention-backend pool contract so this
+        # backend can also be wrapped by hybrid dispatchers.
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token_pool = model_runner.req_to_token_pool
 
         # vortex sparse-decode metadata planner (block tables + seqlens).
         self.plan_decode = get_decode_planner_trtllm(sa.vortex_schedule_policy)

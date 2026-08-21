@@ -93,6 +93,10 @@ class VortexTRTLLMMLABackend(AttentionBackend):
         self.num_blocks_per_page = self.page_size // self.block_size
         self.layers_skip = sa.vortex_layers_skip
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Keep the standard SGLang attention-backend pool contract so this
+        # backend can also be wrapped by hybrid dispatchers.
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token_pool = model_runner.req_to_token_pool
         max_bs = model_runner.req_to_token_pool.size
 
         # Vortex tensors (managed here, mirroring trtllm.py) ----------------
