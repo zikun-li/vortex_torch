@@ -32,3 +32,9 @@ def test_attention_backend_exposes_hybrid_dispatcher_pool_contract(filename, cla
         and target.value.id == "self"
     }
     assert {"token_to_kv_pool", "req_to_token_pool"} <= assigned
+
+
+def test_attention_backends_do_not_read_removed_forward_batch_pool_attribute():
+    backend_root = ROOT / "vortex_torch/engine/sgl/attention_backend"
+    for filename in BACKENDS:
+        assert "forward_batch.token_to_kv_pool" not in (backend_root / filename).read_text()

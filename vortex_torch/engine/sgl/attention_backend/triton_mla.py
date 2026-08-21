@@ -217,7 +217,7 @@ class VortexTritonMLABackend(AttentionBackend):
             k_f = k.view(-1, 1, self.kv_cache_dim)
             kv_c = k_f[..., : self.kv_lora_rank]
             k_pe = k_f[..., self.kv_lora_rank :]
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+            self.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc.to(torch.int64), kv_c, k_pe,
             )
 
@@ -226,14 +226,14 @@ class VortexTritonMLABackend(AttentionBackend):
 
         # 2) indexer fills the sparse block table (topk middle); plan_decode
         #    prefilled BOS/EOS + sparse_seqlens.
-        cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+        cache = self.token_to_kv_pool.get_cache(layer.layer_id)
         self.compiled_indexer.forward(
             q=query, o=md.sparse_block_tables, cache=cache, ctx=self.ctx,
         )
 
         # 3) block-sparse MLA decode in Triton over the fused latent.
         bs = query.shape[0]
-        latent = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+        latent = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1, self.kv_cache_dim
         )
         o = decode_blocktable_mla(

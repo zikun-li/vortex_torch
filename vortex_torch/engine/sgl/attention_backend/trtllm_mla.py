@@ -261,7 +261,7 @@ class VortexTRTLLMMLABackend(AttentionBackend):
         # Sparse path -------------------------------------------------------
         # 1) write the new token's latent into the single fused cache["latent"].
         if save_kv_cache and k is not None:
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+            self.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc.to(torch.int64), k, k_rope
             )
 
@@ -269,14 +269,14 @@ class VortexTRTLLMMLABackend(AttentionBackend):
         # 2) indexer fills the sparse block table (topk middle); plan_decode
         #    prefilled BOS/EOS + sparse_seqlens. Query = fused [q_nope_out | q_pe].
         query = torch.cat([q, q_rope], dim=-1).contiguous()
-        cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+        cache = self.token_to_kv_pool.get_cache(layer.layer_id)
         self.compiled_indexer.forward(
             q=query, o=md.sparse_block_tables, cache=cache, ctx=self.ctx,
         )
 
         # 3) MLA decode over the selected pages, on the fused latent.
         bs = q.shape[0]  # decode batch (one token/request); slice the preallocated metadata
-        kv_cache = forward_batch.token_to_kv_pool.get_fused_latent_buffer(layer.layer_id)
+        kv_cache = self.token_to_kv_pool.get_fused_latent_buffer(layer.layer_id)
         k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
         bmm1_scale = layer.scaling * k_scale
         o = trtllm_batch_decode_with_kv_cache_mla(

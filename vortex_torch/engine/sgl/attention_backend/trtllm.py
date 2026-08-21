@@ -497,7 +497,7 @@ class VortexTRTLLMBackend(AttentionBackend):
             )
             
             
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             k_cache = k_cache.view(-1, self.page_size, 1, self.head_dim)
             v_cache = v_cache.view(-1, self.page_size, 1, self.head_dim)
             o2, s2 = self.prefill_wrapper_paged.forward_return_lse(
@@ -519,7 +519,7 @@ class VortexTRTLLMBackend(AttentionBackend):
             o, _ = merge_state(o1, s1, o2_t, s2_t)
 
         if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
@@ -547,12 +547,12 @@ class VortexTRTLLMBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
         # Read Cache from memory pool
-        cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+        cache = self.token_to_kv_pool.get_cache(layer.layer_id)
 
         # NHD per-tensor cache layout: [num_pages, block_size, 1, head_dim]
         cache_k = cache["k"].view(-1, self.block_size, 1, self.head_dim)

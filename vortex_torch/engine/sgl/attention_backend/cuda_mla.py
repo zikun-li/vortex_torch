@@ -380,7 +380,7 @@ class VortexCudaMLABackend(AttentionBackend):
             k_f = k.view(-1, 1, self.kv_cache_dim)
             kv_c = k_f[..., : self.kv_lora_rank]
             k_pe = k_f[..., self.kv_lora_rank :]
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+            self.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc.to(torch.int64), kv_c, k_pe,
             )
 
@@ -389,7 +389,7 @@ class VortexCudaMLABackend(AttentionBackend):
 
         # 2) indexer fills the sparse block table (topk middle); plan_decode
         #    prefilled BOS/EOS + sparse_seqlens.
-        cache = forward_batch.token_to_kv_pool.get_cache(layer.layer_id)
+        cache = self.token_to_kv_pool.get_cache(layer.layer_id)
         self.compiled_indexer.forward(
             q=query, o=md.sparse_block_tables, cache=cache, ctx=self.ctx,
         )
@@ -398,7 +398,7 @@ class VortexCudaMLABackend(AttentionBackend):
         #    was built once for this step by _plan() (in init_forward_metadata); run()
         #    just consumes it with this layer's block table => one plan, all layers.
         bs = query.shape[0]
-        latent = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+        latent = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1, self.kv_cache_dim
         )
         o = query.new_empty((bs, self.num_qo_heads, self.kv_lora_rank))
@@ -427,7 +427,7 @@ class VortexCudaMLABackend(AttentionBackend):
             q, k, v,
             kv_indices_prefix=getattr(fm, "kv_indices", None),
             key_buffer=(
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 if self._prefill_has_prefix else None
             ),
             kv_b_proj=getattr(layer, "kv_b_proj", None),
