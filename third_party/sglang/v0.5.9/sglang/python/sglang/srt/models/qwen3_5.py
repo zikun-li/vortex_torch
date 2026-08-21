@@ -57,12 +57,17 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -74,6 +79,7 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 # Models
 from sglang.srt.models.qwen3_next import gdn_with_output
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.server_args import get_global_server_args
 
 # Utils
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
@@ -648,7 +654,7 @@ ALL_DECODER_LAYER_TYPES = {
 }
 
 
-class Qwen3_5ForCausalLM(nn.Module):
+class Qwen3_5Model(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
     def __init__(
@@ -825,7 +831,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         return loaded_params
 
 
-class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+class Qwen3_5MoeModel(Qwen3_5Model):
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1020,13 +1026,131 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         return loaded_params
 
 
+class Qwen3_5ForCausalLM(nn.Module):
+    """Text-only Qwen3.5 causal-LM wrapper.
+
+    The multimodal Qwen3.5 classes use ``Qwen3_5Model`` as their language
+    backbone and own the LM head themselves.  Hugging Face text checkpoints,
+    however, advertise ``Qwen3_5ForCausalLM`` directly, so SGLang needs this
+    top-level wrapper to run the logits processor and expose the checkpoint's
+    ``model.*`` parameter namespace.
+    """
+
+    model_cls = Qwen3_5Model
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.pp_group = get_pp_group()
+        self.model = self.model_cls(
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    org_num_embeddings=config.vocab_size,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                )
+        else:
+            self.lm_head = PPMissingLayer()
+
+        self.logits_processor = LogitsProcessor(config)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        **kwargs,
+    ):
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=inputs_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        loaded_head = set()
+
+        def model_weights():
+            for name, loaded_weight in weights:
+                if name.startswith("model.language_model."):
+                    name = name.removeprefix("model.language_model.")
+                elif name.startswith("model."):
+                    name = name.removeprefix("model.")
+                elif name == "lm_head.weight":
+                    if not self.config.tie_word_embeddings:
+                        weight_loader = getattr(
+                            self.lm_head.weight,
+                            "weight_loader",
+                            default_weight_loader,
+                        )
+                        weight_loader(self.lm_head.weight, loaded_weight)
+                        loaded_head.add(name)
+                    continue
+                yield name, loaded_weight
+
+        loaded_model = self.model.load_weights(model_weights())
+        return {f"model.{name}" for name in loaded_model} | loaded_head
+
+
+class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+    model_cls = Qwen3_5MoeModel
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
+
+
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(
         self,
         config: Qwen3_5Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        language_model_cls=Qwen3_5ForCausalLM,
+        language_model_cls=Qwen3_5Model,
     ):
         super().__init__(config, quant_config, prefix, language_model_cls)
 
@@ -1119,7 +1243,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         config: Qwen3_5MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        language_model_cls=Qwen3_5MoeForCausalLM,
+        language_model_cls=Qwen3_5MoeModel,
     ) -> None:
         super().__init__(config, quant_config, prefix, language_model_cls)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
@@ -1342,4 +1466,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [
+    Qwen3_5ForCausalLM,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+]

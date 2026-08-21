@@ -81,6 +81,7 @@ class VortexCachePool(KVCache):
         model_runner,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        layer_ids: Optional[List[int]] = None,
     ):
         super().__init__(
             size,
@@ -94,6 +95,19 @@ class VortexCachePool(KVCache):
         )
         self.head_num = head_num
         self.head_dim = head_dim
+        self.layer_ids = (
+            list(layer_ids)
+            if layer_ids is not None
+            else list(range(self.start_layer, self.start_layer + self.layer_num))
+        )
+        if len(self.layer_ids) != self.layer_num:
+            raise ValueError(
+                f"layer_ids has {len(self.layer_ids)} entries, expected layer_num={self.layer_num}"
+            )
+        self.layer_id_to_cache_index = {
+            layer_id: cache_index
+            for cache_index, layer_id in enumerate(self.layer_ids)
+        }
 
         # for disagg with nvlink
         self.enable_custom_mem_pool = False
@@ -122,6 +136,15 @@ class VortexCachePool(KVCache):
         if self.dtype not in _SET_KV_LAUNCHERS:
             raise ValueError(f"Unsupported dtype {self.dtype} for KV cache")
         self.set_kv_buffer_func = _SET_KV_LAUNCHERS[self.dtype]
+
+    def _cache_index(self, layer_id: int) -> int:
+        try:
+            return self.layer_id_to_cache_index[layer_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"layer_id={layer_id} is not a Vortex full-attention layer; "
+                f"configured layers are {self.layer_ids}"
+            ) from exc
         
     def _compile(self, model_runner) -> None:
         """Trace the sparse-attention cache flow on zero-sized dummies and compile it."""
@@ -232,9 +255,8 @@ class VortexCachePool(KVCache):
         (disagg Option B; correct because no ``forward_cache`` reads an
         indexer-``Save``-accumulated field).
         """
-        layers = range(self.start_layer, self.start_layer + self.layer_num)
-        k_bufs = [self.cache[l - self.start_layer]["k"] for l in layers]
-        v_bufs = [self.cache[l - self.start_layer]["v"] for l in layers]
+        k_bufs = [layer_cache["k"] for layer_cache in self.cache]
+        v_bufs = [layer_cache["v"] for layer_cache in self.cache]
         page_item_numel = self.page_size * self.head_num * self.head_dim
 
         ptrs, data_lens, item_lens = [], [], []
@@ -263,11 +285,11 @@ class VortexCachePool(KVCache):
         if loc is None or loc.numel() == 0:
             return
         loc = loc.to(torch.int64)
-        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+        for layer_id in self.layer_ids:
             if layer_id in self.layers_skip:
                 continue
             self.compiled_cache.forward(
-                self.cache[layer_id - self.start_layer], loc, ctx=self.ctx
+                self.cache[self._cache_index(layer_id)], loc, ctx=self.ctx
             )
 
     def maybe_get_custom_mem_pool(self):
@@ -299,20 +321,21 @@ class VortexCachePool(KVCache):
 
     def get_key_buffer(self, layer_id: int):
         
-        return self.cache[layer_id - self.start_layer]["k"]
+        return self.cache[self._cache_index(layer_id)]["k"]
 
     def get_value_buffer(self, layer_id: int):
         
-        return self.cache[layer_id - self.start_layer]["v"]
+        return self.cache[self._cache_index(layer_id)]["v"]
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         
-        return self.cache[layer_id - self.start_layer]["k"], self.cache[layer_id - self.start_layer]["v"]
+        cache = self.cache[self._cache_index(layer_id)]
+        return cache["k"], cache["v"]
 
         
     def get_cache(self, layer_id: int)->Dict[str, torch.Tensor]:
         
-        return self.cache[layer_id - self.start_layer]
+        return self.cache[self._cache_index(layer_id)]
 
         
     def set_kv_buffer(
@@ -349,9 +372,10 @@ class VortexCachePool(KVCache):
             if v_scale is not None:
                 cache_v = cache_v.div(v_scale)
 
+        cache = self.cache[self._cache_index(layer_id)]
         self.set_kv_buffer_func(
-            self.cache[layer_id - self.start_layer]["k"],
-            self.cache[layer_id - self.start_layer]["v"],
+            cache["k"],
+            cache["v"],
             cache_k.contiguous(),
             cache_v.contiguous(),
             loc,
@@ -359,7 +383,7 @@ class VortexCachePool(KVCache):
         )
         if layer_id in self.layers_skip:
             return
-        self.compiled_cache.forward(self.cache[layer_id - self.start_layer], loc, ctx=self.ctx)
+        self.compiled_cache.forward(cache, loc, ctx=self.ctx)
         
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         

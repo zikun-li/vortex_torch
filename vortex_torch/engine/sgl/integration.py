@@ -70,6 +70,22 @@ def _make_trtllm_mla_shim(orig):
     return create
 
 
+def _make_trtllm_mha_shim(orig):
+    def create(runner):
+        sa = runner.server_args
+        if (not runner.use_mla_backend) and sa.enable_vortex_sparsity:
+            # Blackwell hybrid-GDN models (Qwen3.5/Qwen3-Next) only permit
+            # triton or trtllm_mha as their full-attention backend.  Route
+            # trtllm_mha to Vortex's sparse TRT-LLM MHA implementation; the
+            # stock HybridLinearAttnBackend then dispatches linear layers to
+            # GDN and full-attention layers here.
+            from .attention_backend import VortexTRTLLMBackend
+            return VortexTRTLLMBackend(runner)
+        return orig(runner)
+
+    return create
+
+
 def _make_triton_shim(orig):
     def create(runner):
         sa = runner.server_args
@@ -114,6 +130,8 @@ def integrate() -> bool:
         B["flashinfer"] = _make_flashinfer_shim(B["flashinfer"])
     if "trtllm_mla" in B:
         B["trtllm_mla"] = _make_trtllm_mla_shim(B["trtllm_mla"])
+    if "trtllm_mha" in B:
+        B["trtllm_mha"] = _make_trtllm_mha_shim(B["trtllm_mha"])
     if "triton" in B:
         B["triton"] = _make_triton_shim(B["triton"])
     B["cuda_mla"] = _create_cuda_mla_backend
@@ -174,17 +192,34 @@ def make_kv_pool(runner):
     """
     from sglang.srt.layers.dp_attention import get_attention_tp_size
 
+    # Linear-attention hybrids keep recurrent state in HybridReqToTokenPool;
+    # only their full-attention layers need Vortex KV/aux pages.  Compacting
+    # those layers avoids allocating full K/V and page summaries for every GDN
+    # layer (Qwen3.5 has 6 full layers out of 24).
+    full_attention_layer_ids = None
+    if runner.mambaish_config is not None:
+        full_attention_layer_ids = [
+            layer_id
+            for layer_id in runner.mambaish_config.full_attention_layer_ids
+            if runner.start_layer <= layer_id < runner.end_layer
+        ]
+
     common = dict(
         size=runner.max_total_num_tokens,
         page_size=runner.page_size,
         dtype=runner.kv_cache_dtype,
-        layer_num=runner.num_effective_layers,
+        layer_num=(
+            len(full_attention_layer_ids)
+            if full_attention_layer_ids is not None
+            else runner.num_effective_layers
+        ),
         device=runner.device,
         enable_memory_saver=runner.server_args.enable_memory_saver,
         sparse_attention=runner.sparse_attention,
         model_runner=runner,
         start_layer=runner.start_layer,
         end_layer=runner.end_layer,
+        layer_ids=full_attention_layer_ids,
     )
     if runner.use_mla_backend:
         from .memory_pool_mla import VortexMLACachePool
@@ -216,12 +251,18 @@ def make_kv_pool(runner):
         model_runner=runner,
         start_layer=common["start_layer"],
         end_layer=common["end_layer"],
+        layer_ids=common["layer_ids"],
     )
 
 
 def kv_cell_size(runner, num_layers: int, kv_size: int) -> int:
     """Vortex KV-cache bytes-per-token for the available-memory estimate."""
     from sglang.srt.layers.dp_attention import get_attention_tp_size
+    if runner.mambaish_config is not None:
+        num_layers = sum(
+            runner.start_layer <= layer_id < runner.end_layer
+            for layer_id in runner.mambaish_config.full_attention_layer_ids
+        )
     return int(
         runner.model_config.get_num_kv_heads(get_attention_tp_size())
         * runner.model_config.head_dim
