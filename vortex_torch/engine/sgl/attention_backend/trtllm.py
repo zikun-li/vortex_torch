@@ -12,15 +12,21 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Union, Dict
 import torch
 from vortex_torch import is_hopper
-from vortex_torch.abs import as_vtensor, FORMAT
-from vortex_torch.indexer import Context, MetaData
-from vortex_torch.indexer.compiler.compile import compile as compile_indexer
+from vortex_torch.indexer import Context
 from vortex_torch.indexer.utils_sglang import (
     get_chunkwise_hn2nh_transpose,
     get_chunkwise_nh2hn_transpose,
+    get_decode_planner,
     get_decode_planner_trtllm,
     get_prefill_planner,
 )
+from vortex_torch.engine.sgl.attention_backend.flashinfer import (
+    VortexFlashInferBackend,
+)
+from vortex_torch.engine.sgl.attention_backend.prefill_sparse import (
+    VortexSparsePrefillWrapper,
+)
+from vortex_torch.engine.sgl.prefill_patch import PrefillPatchRuntime
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
 
@@ -40,7 +46,6 @@ if is_flashinfer_available():
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
-    from flashinfer.cascade import merge_state
     from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 
 
@@ -119,6 +124,32 @@ class VortexTRTLLMBackend(AttentionBackend):
         self.page_size = model_runner.server_args.page_size
         self.block_size = model_runner.server_args.vortex_block_size
         self.layers_skip = model_runner.server_args.vortex_layers_skip
+        self.sparse_prefill = bool(model_runner.server_args.vortex_sparse_prefill)
+        if self.sparse_prefill:
+            _sa = model_runner.server_args
+            if getattr(_sa, "chunked_prefill_size", None) != -1:
+                raise ValueError(
+                    "vortex_sparse_prefill requires chunked_prefill_size=-1 (got "
+                    f"{getattr(_sa, 'chunked_prefill_size', None)!r}); sparse prefill "
+                    "is fresh-prompt only."
+                )
+            if not getattr(_sa, "disable_radix_cache", False):
+                raise ValueError(
+                    "vortex_sparse_prefill requires disable_radix_cache=True; a "
+                    "cached prompt prefix would enter a paged-prefix path the "
+                    "sparse-prefill path does not handle (fresh-prompt only)."
+                )
+            _cap = min(1024, 8192 // self.num_kv_heads)
+            if self.block_size > _cap:
+                raise ValueError(
+                    f"vortex_sparse_prefill unsupported for block_size="
+                    f"{self.block_size} with num_kv_heads={self.num_kv_heads}: a "
+                    f"query tile can't be smaller than one block, so block_size must "
+                    f"be <= min(1024, 8192//num_kv_heads)={_cap} "
+                    f"(block_size*num_kv_heads <= 8192). Reduce block_size or nkv."
+                )
+        self.ctx_prefill: Optional[Context] = None
+        self.compiled_indexer_prefill = None
         self.num_blocks_per_page = self.page_size // self.block_size
         assert self.page_size % self.block_size == 0, "Page size must be a multiple of block size."
         # ===========================
@@ -216,6 +247,11 @@ class VortexTRTLLMBackend(AttentionBackend):
         )
 
         self.plan_decode = get_decode_planner_trtllm(model_runner.server_args.vortex_schedule_policy)
+        self.plan_decode_prefill = (
+            get_decode_planner(model_runner.server_args.vortex_schedule_policy)
+            if self.sparse_prefill
+            else None
+        )
         self.plan_prefill = get_prefill_planner()
         self.chunkwise_nh2hn_transpose = get_chunkwise_nh2hn_transpose()
         self.chunkwise_hn2nh_transpose = get_chunkwise_hn2nh_transpose()
@@ -229,6 +265,22 @@ class VortexTRTLLMBackend(AttentionBackend):
         self.sparse_attention = model_runner.sparse_attention
         self.ctx = Context()
         self._compile(model_runner)
+        self.prefill_patch = PrefillPatchRuntime(
+            model_runner, block_size=self.block_size, layers_skip=self.layers_skip
+        )
+        if self.prefill_patch.enabled:
+            mode = self.prefill_patch.config.mode
+            if not self.gt_decode:
+                raise ValueError("prefill patch analysis currently supports GT top-k only")
+            if mode == "capture_dense":
+                if self.sparse_prefill:
+                    raise ValueError(
+                        "capture_dense requires vortex_sparse_prefill=False"
+                    )
+            elif not self.gt_prefill:
+                raise ValueError(
+                    f"{mode} requires vortex_sparse_prefill=True with GT top-k"
+                )
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata: Dict[int, DecodeMetadata] = {}
@@ -236,55 +288,47 @@ class VortexTRTLLMBackend(AttentionBackend):
 
 
     def _compile(self, model_runner: "ModelRunner") -> None:
-        """Trace the sparse-attention indexer on zero-sized dummies and compile it."""
-        device = model_runner.device
-        dtype = self.q_data_type
-        indexer = self.sparse_attention.forward_indexer
+        """Compile TRT decode plus an optional CSR sparse-prefill indexer."""
+        self.compiled_indexer = VortexFlashInferBackend._trace_and_compile(
+            self,
+            self.ctx,
+            model_runner,
+            prefill=False,
+            attention_backend="trtllm",
+        )
 
-        self.ctx.create(self, model_runner)
-        # Allocate every per-forward-batch buffer (winfo_*, dense/sparse
-        # block_tables + seqlens, kv_last_page_len) on a single MetaData
-        # owned by the context. The decode planner writes into this
-        # MetaData; the indexer kernels read from it.
-        self.ctx.metadata = MetaData.preallocate(self.ctx, device=device)
-        self.ctx.assert_created()
-        self.ctx.profile()
+        from vortex_torch.indexer import GTTopK
 
-        def register(vt, name: str) -> None:
-            self.ctx.tensor_list.append(vt)
-            self.ctx.output_tensor_to_op_list.append(None)
-            self.ctx.tensor_id_to_tensor_name_map[vt.tensor_id] = name
-
-        def make_dummy(shape, fmt, tensor_id, *, tdtype=dtype, zeros=False):
-            factory = torch.zeros if zeros else torch.empty
-            return as_vtensor(factory(shape, device=device, dtype=tdtype), fmt, tensor_id=tensor_id)
-
-        with torch.no_grad():
-            q_dummy = make_dummy((0, self.group_size, self.head_dim), FORMAT.BATCHED, tensor_id=0)
-            register(q_dummy, "q")
-
-            o_dummy = make_dummy((0, 1, 1), FORMAT.RAGGED, tensor_id=1)
-            register(o_dummy, "o")
-
-            cache_dummy = {}
-            for i, (name, (shape, cache_dtype)) in enumerate(
-                self.sparse_attention.get_cache_meta_info().items()
-            ):
-                vt = make_dummy(
-                    (0, shape[0], shape[1]),
-                    FORMAT.PAGED,
-                    tensor_id=2 + i,
-                    tdtype=cache_dtype,
-                    zeros=True,
+        self.gt_decode = any(isinstance(op, GTTopK) for op in self.ctx.op_list)
+        self.gt_prefill = False
+        if self.sparse_prefill:
+            self.ctx_prefill = Context()
+            self.compiled_indexer_prefill = (
+                VortexFlashInferBackend._trace_and_compile(
+                    self,
+                    self.ctx_prefill,
+                    model_runner,
+                    prefill=True,
+                    attention_backend="flashinfer",
                 )
-                cache_dummy[name] = vt
-                register(vt, f"cache['{name}']")
-
-            indexer(q_dummy, o_dummy, cache_dummy, ctx=self.ctx)
-
-        self.compiled_indexer = compile_indexer(self.ctx)()
-        self.ctx.summary()
-        self.ctx.execute()
+            )
+            self.gt_prefill = any(
+                isinstance(op, GTTopK) for op in self.ctx_prefill.op_list
+            )
+            self.prefill_scores = torch.zeros(
+                (self.ctx_prefill.max_num_blocks, 1, 1),
+                dtype=torch.float32,
+                device=model_runner.device,
+            )
+            self.prefill_sparse_wrapper = VortexSparsePrefillWrapper(
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                device=model_runner.device,
+                workspace_buffer=self.workspace_buffer,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.q_data_type,
+            )
 
     
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -459,71 +503,12 @@ class VortexTRTLLMBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        
-        assert not layer.is_cross_attention
-        cache_loc = forward_batch.out_cache_loc
-        
-        logits_soft_cap = layer.logit_cap
+        return VortexFlashInferBackend.forward_extend(
+            self, q, k, v, layer, forward_batch, save_kv_cache
+        )
 
-        q = q.contiguous()
-
-        if self.forward_metadata.extend_no_prefix:
-            o = self.prefill_wrapper_ragged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
-
-        else:
-            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-                )
-            
-            q_t = self.chunkwise_nh2hn_transpose(
-                q.view(-1, self.num_qo_heads, self.head_dim),
-                self.qo_indptr[0],
-                self.batch_table,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim
-            )
-            
-            
-            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            k_cache = k_cache.view(-1, self.page_size, 1, self.head_dim)
-            v_cache = v_cache.view(-1, self.page_size, 1, self.head_dim)
-            o2, s2 = self.prefill_wrapper_paged.forward_return_lse(
-                q_t,
-                (k_cache, v_cache),
-                causal=False,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-                )
-            o2_t, s2_t = self.chunkwise_hn2nh_transpose(
-                o2,  s2,
-                self.qo_indptr[0],
-                self.batch_table,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim
-            )
-            
-            o, _ = merge_state(o1, s1, o2_t, s2_t)
-
-        if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
-
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+    _forward_extend_sparse = VortexFlashInferBackend._forward_extend_sparse
+    _apply_gt_prefill_patch = VortexFlashInferBackend._apply_gt_prefill_patch
 
     def forward_decode(
         self,
