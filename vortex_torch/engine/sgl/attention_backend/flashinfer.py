@@ -151,8 +151,10 @@ class VortexFlashInferBackend(AttentionBackend):
         
         # Assign key configuration and parameters
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        # sglang 0.5.13: the KV pool lives on model_runner, not ForwardBatch.
+        # SGLang's hybrid-linear dispatcher aliases these public pool handles
+        # from its full-attention backend.
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.page_size = model_runner.server_args.page_size
         self.block_size = model_runner.server_args.vortex_block_size
         self.layers_skip = model_runner.server_args.vortex_layers_skip
@@ -289,6 +291,9 @@ class VortexFlashInferBackend(AttentionBackend):
         ]
         
         self.plan_decode = get_decode_planner(model_runner.server_args.vortex_schedule_policy)
+        # Sparse prefill always uses the CSR planner, including when this
+        # implementation is reused by the TRT-LLM decode backend.
+        self.plan_decode_prefill = self.plan_decode
         self.plan_prefill = get_prefill_planner()
         self.chunkwise_nh2hn_transpose = get_chunkwise_nh2hn_transpose()
         self.chunkwise_hn2nh_transpose = get_chunkwise_hn2nh_transpose()
@@ -364,17 +369,28 @@ class VortexFlashInferBackend(AttentionBackend):
                 q_data_type=self.q_data_type, kv_data_type=self.q_data_type,
             )
 
-    def _trace_and_compile(self, ctx: "Context", model_runner: "ModelRunner",
-                           *, prefill: bool):
+    def _trace_and_compile(
+        self,
+        ctx: "Context",
+        model_runner: "ModelRunner",
+        *,
+        prefill: bool,
+        attention_backend: Optional[str] = None,
+    ):
         """Trace ``forward_indexer`` on zero-leading-dim dummies into ``ctx`` and
         compile it. Shared by the decode (``prefill=False``) and sparse-prefill
-        (``prefill=True``) compiles — only the Context budgets + terminal
-        lowering differ (both driven off ``ctx.sparse_prefill``)."""
+        (``prefill=True``) compiles. Context budgets, terminal lowering, and an
+        optional per-compile attention layout can differ."""
         device = model_runner.device
         dtype = self.q_data_type
         indexer = self.sparse_attention.forward_indexer
 
-        ctx.create(self, model_runner, prefill=prefill)
+        ctx.create(
+            self,
+            model_runner,
+            prefill=prefill,
+            attention_backend=attention_backend,
+        )
         # Allocate every per-forward-batch buffer (winfo_*, dense/sparse
         # kv_indptr+indices, kv_last_page_len) on a MetaData owned by the
         # context. The planner writes into this MetaData; the indexer kernels
@@ -1001,7 +1017,7 @@ class VortexFlashInferBackend(AttentionBackend):
                 # (1) pseudo-request plan for the tile (local causal pos+1 = a+1..b)
                 cached = torch.arange(a + 1, b + 1, device=device, dtype=torch.int32)
                 reqidx = torch.full((tlen,), req_idx_r, device=device, dtype=torch.int64)
-                self.plan_decode(
+                self.plan_decode_prefill(
                     cached_seq_lens=cached, req_to_token=self.req_to_token,
                     req_indices=reqidx, ctx=self.ctx_prefill,
                 )

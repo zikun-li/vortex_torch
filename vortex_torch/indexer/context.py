@@ -183,8 +183,15 @@ class Context(ContextBase):
         self.metadata.set_batch_size(n)
 
     # ------------------------------------------------------------------
-    def create(self, parent: Any, model_runner: Any, *, overwrite: bool = False,
-               prefill: bool = False) -> "Context":
+    def create(
+        self,
+        parent: Any,
+        model_runner: Any,
+        *,
+        overwrite: bool = False,
+        prefill: bool = False,
+        attention_backend: Optional[str] = None,
+    ) -> "Context":
         """Populate the static fields. Per-batch ``MetaData`` is allocated
         separately by the caller via ``MetaData.preallocate(ctx, device=...)``
         — see this class's docstring.
@@ -194,12 +201,22 @@ class Context(ContextBase):
         (not the concurrent-request count), and the intermediate-RAGGED / CSR
         block budget is re-derived to the causal score-axis bound. See
         ``sparse_prefill`` in ``__slots__`` and memory ``sparse-prefill-gqa-design``.
+
+        ``attention_backend`` overrides the server-wide backend for this one
+        compiled context. This is used by the TRT-LLM MHA backend, whose decode
+        indexer consumes TRT block tables while sparse prefill consumes the
+        FlashInfer/CSR layout.
         """
         if self._created and not overwrite:
             raise RuntimeError("Context.create() already called; pass overwrite=True to reinitialize.")
 
         self.sparse_prefill = bool(prefill)
         sa = model_runner.server_args
+        effective_attention_backend = (
+            attention_backend
+            if attention_backend is not None
+            else getattr(sa, "vortex_attention_backend", "flashinfer")
+        ) or "flashinfer"
         max_pages_per_req = (
             (model_runner.model_config.context_len + sa.page_size - 1) // sa.page_size
             if sa.vortex_max_seq_lens < 0
@@ -271,9 +288,7 @@ class Context(ContextBase):
         # never read (the planner just doesn't write to them).
         # NB: ``self.vortex_attention_backend`` is assigned further down
         # in this method, so read off ``sa`` directly.
-        _attn_backend = (
-            getattr(sa, "vortex_attention_backend", "flashinfer") or "flashinfer"
-        )
+        _attn_backend = effective_attention_backend
         if _attn_backend == "trtllm" and self.max_num_blocks_per_request % 4 != 0:
             self.max_num_blocks_per_request = (
                 (self.max_num_blocks_per_request + 3) // 4 * 4
@@ -309,9 +324,7 @@ class Context(ContextBase):
         self.deterministic_topk = bool(getattr(sa, "vortex_deterministic_topk", False))
         self.sparse_attention_name = parent.sparse_attention.__class__.__name__.lower() + f"_{uuid.uuid4().hex[:8]}"  # unique name for this attention instance
         self.impl_backend = getattr(sa, "vortex_impl_backend", "triton") or "triton"
-        self.vortex_attention_backend = getattr(
-            sa, "vortex_attention_backend", "flashinfer"
-        ) or "flashinfer"
+        self.vortex_attention_backend = effective_attention_backend
         self.use_tensor_core = bool(getattr(sa, "vortex_use_tensor_core", False))
         # Tensor-core (bf16-compute + tl.dot) codegen is implemented only
         # in the triton W-kernel backend. The cuda backend has its own

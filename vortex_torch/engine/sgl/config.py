@@ -95,8 +95,10 @@ class VortexConfig:
     attention_backend: str = "flashinfer"
     impl_backend: str = "triton"
     use_tensor_core: bool = False
-    # Opt-in GQA sparse-prefill path (flashinfer VariableBlockSparseAttention).
-    # Default off preserves the historical dense-prefill behaviour exactly.
+    # Opt-in GQA sparse-prefill path (FlashInfer block-sparse attention). This
+    # works with both FlashInfer decode and TRT-LLM MHA decode; the latter keeps
+    # a separate CSR prefill indexer context. Default off preserves the
+    # historical dense-prefill behaviour exactly.
     sparse_prefill: bool = False
     # Deterministic GT top-k: propagate deterministic=True to flashinfer's
     # top_k_ragged_transform for single-request bit-exact block selection (pair with
